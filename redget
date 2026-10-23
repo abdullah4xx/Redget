@@ -378,21 +378,21 @@ def draw_box(p, rect, radius, color, outline=None, stitched=False):
     if woven:
         p.setBrush(color)
         p.setPen(QPen(QColor(outline or T()["line"]), 1))
-        p.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
+        p.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
         if stitched:
-            draw_woven_seam(p, rect)
+            draw_woven_seam(p, rect, radius)
     else:
         p.setBrush(color)
         p.setPen(QPen(QColor(outline), 1) if outline else Qt.PenStyle.NoPen)
         p.drawRoundedRect(rect, radius, radius)
 
 
-def draw_woven_seam(p, rect):
+def draw_woven_seam(p, rect, radius=0):
     p.save()
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.setPen(QPen(C("line"), 1))
-    inset = px(5)
-    left, right, top = rect.left() + inset, rect.right() - inset, rect.top() + px(3)
+    inset = radius + px(5)
+    left, right, top = rect.left() + inset, rect.right() - inset, rect.top() + radius + px(3)
     p.drawLine(QPointF(left, top), QPointF(right, top))
     step = px(6)
     x = left + px(2)
@@ -521,7 +521,7 @@ class PillButton(QAbstractButton):
         if not self.isEnabled():
             p.setOpacity(0.5)
         r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
-        rad = px(2) if woven else r.height() / 2
+        rad = px(6) if woven else r.height() / 2
         kind = "red" if (self.isCheckable() and self.isChecked()) else self._kind
         fg = C("text")
         if kind in ("white", "round"):
@@ -628,7 +628,7 @@ class Surface(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
         woven = STYLE["theme"] == "woven"
-        rad = px(2) if woven else self._radius if self._radius else r.height() / 2
+        rad = px(8) if woven else self._radius if self._radius else r.height() / 2
         if not woven:
             draw_shadow(p, r, rad)
         draw_box(p, r, rad, C("pill") if self._radius is None else C("card"),
@@ -657,7 +657,7 @@ class Chip(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect())
         woven = STYLE["theme"] == "woven"
-        draw_box(p, r, px(2) if woven else r.height() / 2, C("chip"),
+        draw_box(p, r, px(5) if woven else r.height() / 2, C("chip"),
                  stitched=woven)
         col = C("chip_text")
         s = px(10)
@@ -683,7 +683,7 @@ class LogoMark(QWidget):
         s = w * (0.72 if woven else 0.62)
         r = QRectF(-s / 2, -s / 2, s, s)
         if woven:
-            draw_box(p, r, px(2), C("text"))
+            draw_box(p, r, px(3), C("text"))
         else:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(C("text"))
@@ -705,7 +705,7 @@ class SourceIcon(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         if STYLE["theme"] == "woven":
-            draw_box(p, r, px(2), QColor(STYLE["accent"]))
+            draw_box(p, r, px(4), QColor(STYLE["accent"]))
         else:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(red_gradient(r))
@@ -727,7 +727,7 @@ class ThemeToggle(QAbstractButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         woven = STYLE["theme"] == "woven"
         r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
-        radius = px(2) if woven else r.height() / 2
+        radius = px(7) if woven else r.height() / 2
         if not woven:
             draw_shadow(p, r, radius)
         draw_box(p, r, radius, C("pill"), stitched=woven)
@@ -736,7 +736,7 @@ class ThemeToggle(QAbstractButton):
         kw = r.width() / 2 - inset
         kx = r.left() + inset if light else r.right() - inset - kw
         kr = QRectF(kx, r.top() + inset, kw, r.height() - 2 * inset)
-        draw_box(p, kr, px(1) if woven else kr.height() / 2,
+        draw_box(p, kr, px(5) if woven else kr.height() / 2,
                  QColor(STYLE["accent"]) if woven else red_gradient(kr))
         s = px(13)
         lr = QRectF(r.left() + inset + (kw - s) / 2, r.center().y() - s / 2, s, s)
@@ -808,7 +808,7 @@ def rounded_pix(pix, w, h, r, dpr=1.0):
     out.fill(Qt.GlobalColor.transparent)
     p = QPainter(out)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    radius = 0 if STYLE["theme"] == "woven" else r * dpr
+    radius = px(8) * dpr if STYLE["theme"] == "woven" else r * dpr
     p.setClipPath(rounded_path(QRectF(0, 0, W, H), radius))
     p.drawPixmap((W - pix.width()) // 2, (H - pix.height()) // 2, pix)
     p.end()
@@ -1462,12 +1462,12 @@ def build_qss():
     acc = QColor(STYLE["accent"])
     top, mid, bot = accent_trio()
     check = os.path.join(CACHE_DIR, f"check-{accent_foreground().name()[1:]}.png").replace("\\", "/")
-    menu_radius = px(3) if STYLE["theme"] == "woven" else px(14)
-    item_radius = px(2) if STYLE["theme"] == "woven" else px(9)
-    field_radius = px(2) if STYLE["theme"] == "woven" else px(13)
-    check_radius = px(1) if STYLE["theme"] == "woven" else px(6)
-    history_radius = px(2) if STYLE["theme"] == "woven" else px(14)
-    button_radius = px(2) if STYLE["theme"] == "woven" else px(12)
+    menu_radius = px(8) if STYLE["theme"] == "woven" else px(14)
+    item_radius = px(5) if STYLE["theme"] == "woven" else px(9)
+    field_radius = px(8) if STYLE["theme"] == "woven" else px(13)
+    check_radius = px(3) if STYLE["theme"] == "woven" else px(6)
+    history_radius = px(8) if STYLE["theme"] == "woven" else px(14)
+    button_radius = px(6) if STYLE["theme"] == "woven" else px(12)
     return f"""
 * {{ font-family: "{STYLE['family']}"; }}
 QLabel {{ color: {t['text']}; background: transparent; }}
@@ -2705,7 +2705,7 @@ class AppPill(QWidget):
         rad = r.height() / 2
         woven = STYLE["theme"] == "woven"
         if woven:
-            draw_box(p, r, px(2), QColor(STYLE["accent"]), stitched=self._hover)
+            draw_box(p, r, px(6), QColor(STYLE["accent"]), stitched=self._hover)
         else:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, 40))
