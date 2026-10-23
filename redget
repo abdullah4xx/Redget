@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RedGet 6.0.0 - video/audio downloader (PyQt6 front-end for yt-dlp)."""
+"""RedGet 6.2.0 - video/audio downloader (PyQt6 front-end for yt-dlp)."""
 import sys, os, re, json, time, shutil, zipfile, platform, traceback, hashlib, signal, io
 from PyQt6.QtCore import (Qt, QObject, QProcess, QProcessEnvironment, QTimer, QUrl, QSettings,
                           QRectF, QPointF, QPoint, QSize, QRect, pyqtSignal)
@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QCheckBox, QPushButton, QListWidget, QListWidgetItem, QProgressBar, QFrame, QStackedWidget,
     QFileDialog, QSizePolicy, QScrollArea, QColorDialog, QMenu, QMessageBox, QAbstractButton)
 
-VERSION = "6.1.0"
+VERSION = "6.2.0"
 DATA_DIR = os.path.expanduser("~/.local/share/redget")
 CACHE_DIR = os.path.expanduser("~/.cache/redget")
 BIN_DIR = os.path.join(DATA_DIR, "bin")
