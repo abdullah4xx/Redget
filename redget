@@ -1,0 +1,2710 @@
+#!/usr/bin/env python3
+"""RedGet 6.0.0 - video/audio downloader (PyQt6 front-end for yt-dlp)."""
+import sys, os, re, json, time, shutil, zipfile, platform, traceback, hashlib, signal, io
+from PyQt6.QtCore import (Qt, QObject, QProcess, QProcessEnvironment, QTimer, QUrl, QSettings,
+                          QRectF, QPointF, QPoint, QSize, QRect, pyqtSignal)
+from PyQt6.QtGui import (QDesktopServices, QIcon, QGuiApplication, QPainter, QColor, QPalette,
+                         QPixmap, QPainterPath, QFont, QFontDatabase, QFontMetrics,
+                         QLinearGradient, QPen, QBrush)
+from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QLineEdit, QCheckBox, QPushButton, QListWidget, QListWidgetItem, QProgressBar, QFrame, QStackedWidget,
+    QFileDialog, QSizePolicy, QScrollArea, QColorDialog, QMenu, QMessageBox, QAbstractButton)
+
+VERSION = "6.1.0"
+DATA_DIR = os.path.expanduser("~/.local/share/redget")
+CACHE_DIR = os.path.expanduser("~/.cache/redget")
+BIN_DIR = os.path.join(DATA_DIR, "bin")
+LOCAL_YTDLP = os.path.join(BIN_DIR, "yt-dlp")
+LOCAL_DENO = os.path.join(BIN_DIR, "deno")
+YTDLP_BASE = "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/"
+YTDLP_URL = YTDLP_BASE + "yt-dlp"
+YTDLP_SUMS_URL = YTDLP_BASE + "SHA2-256SUMS"
+HIST_FILE = os.path.join(DATA_DIR, "history.json")
+LOG = os.path.join(CACHE_DIR, "redget.log")
+DEFAULT_DIR = os.path.join(os.path.expanduser("~/Downloads"), "RedGet")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+ASSETS = next((p for p in (os.path.normpath(os.path.join(_HERE, "..", "share", "redget")),
+                           "/usr/share/redget") if os.path.isdir(p)), "/usr/share/redget")
+SETSID = shutil.which("setsid")
+URL_RE = re.compile(r"https?://[^\s<>\"']+")
+UPDATE_REPO = "abdullah4xx/redget"
+UPDATE_RAW = "https://raw.githubusercontent.com/" + UPDATE_REPO + "/main/"
+APP_DIR = os.path.join(DATA_DIR, "app")
+APP_FILE = os.path.join(APP_DIR, "redget")
+APP_PENDING = os.path.join(APP_DIR, "pending")
+SKIP_FILE = os.path.join(DATA_DIR, "skip_version")
+SUPPORTED_URL = "https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md"
+SOURCE_URL = "https://github.com/yt-dlp/yt-dlp"
+PARTS_CHOICES = [("Off", 0), ("4 parts", 4), ("8 parts", 8), ("16 parts", 16)]
+GENERIC_HEIGHTS = [2160, 1440, 1080, 720, 480, 360]
+AUDIO_CHOICES = [("Audio, mp3", "mp3"), ("Audio, m4a", "m4a"), ("Audio, opus", "opus")]
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+SEP = "\x1f"
+
+ACCENTS = [("Red", "#c8171d"), ("Crimson", "#dc143c"), ("Orange", "#ff8a3d"), ("Amber", "#f5a524"),
+           ("Yellow", "#e6b800"), ("Lime", "#6fae12"), ("Emerald", "#16a34a"), ("Mint", "#14b8a6"),
+           ("Cyan", "#0ea5c6"), ("Sky", "#2f8df0"), ("Blue", "#3b5bdb"), ("Indigo", "#5b4fe0"),
+           ("Violet", "#7c4dff"), ("Purple", "#a24df0"), ("Magenta", "#d63fb8"), ("Rose", "#ec4a6c")]
+DEFAULT_ACCENT = "#c8171d"
+
+THEMES = {
+    "light": dict(panel_top="#f3f3f3", panel_bot="#b2b2b2", ring=(255, 255, 255, 110), pill="#ffffff",
+                  pill_hover="#f4f4f4", text="#14161a", sub="#6f6f73", chip="#d8d8d8", chip_text="#6f6f73",
+                  card="#ffffff", line="#e6e6e6", field="#f1f1f1", gray="#dcdcdc", gray_text="#6a6a6e",
+                  strip_top="#d4d4d4", strip_bot="#a8a8a8", dim=0),
+    "dark": dict(panel_top="#3c3c42", panel_bot="#141416", ring=(20, 20, 24, 135), pill="#2d2d33",
+                 pill_hover="#38383f", text="#f3f3f5", sub="#a2a2aa", chip="#3e3e45", chip_text="#b6b6be",
+                 card="#232327", line="#3a3a41", field="#2a2a30", gray="#3e3e45", gray_text="#c8c8cf",
+                 strip_top="#4a4a52", strip_bot="#26262b", dim=110),
+}
+
+# ---------------------------------------------------------------- scaling / style state
+K = 1.0
+STYLE = dict(theme="light", accent=DEFAULT_ACCENT, family="Sans")
+
+
+def px(n):
+    return max(1, int(round(n * K)))
+
+
+def T():
+    return THEMES[STYLE["theme"]]
+
+
+def C(key):
+    return QColor(T()[key])
+
+
+def accent_trio():
+    c = QColor(STYLE["accent"])
+    return c.lighter(128), c, c.darker(150)
+
+
+def mkfont(size, weight=QFont.Weight.Normal):
+    f = QFont(STYLE["family"])
+    f.setPixelSize(px(size))
+    f.setWeight(weight)
+    return f
+
+
+def pick_family():
+    have = set(QFontDatabase.families())
+    for name in ("Hanken Grotesk", "Sofia Sans", "Space Grotesk", "Instrument Sans", "Manrope",
+                 "Plus Jakarta Sans", "Inter", "Noto Sans", "Cantarell", "Ubuntu", "DejaVu Sans"):
+        if name in have:
+            return name
+    return QApplication.font().family()
+
+
+def log_error(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        if os.path.isfile(LOG) and os.path.getsize(LOG) > 1_000_000:
+            os.replace(LOG, LOG + ".old")
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg + "\n")
+    except Exception:
+        pass
+
+
+def excepthook(et, ev, tb):
+    log_error("".join(traceback.format_exception(et, ev, tb)))
+
+
+# ---------------------------------------------------------------- icons (drawn, no image files)
+_NUM = re.compile(r"[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?")
+
+
+def svg_path(d):
+    """Tiny SVG path parser (M L H V C S Z, absolute and relative)."""
+    path = QPainterPath()
+    toks = re.findall(r"[MmLlHhVvCcSsZz]|" + _NUM.pattern, d)
+    i, cmd = 0, None
+    x = y = sx = sy = 0.0
+    lc = None
+
+    def take(n):
+        nonlocal i
+        v = [float(t) for t in toks[i:i + n]]
+        i += n
+        return v
+    while i < len(toks):
+        t = toks[i]
+        if t.isalpha():
+            cmd = t
+            i += 1
+            if cmd in "Zz":
+                path.closeSubpath()
+                x, y = sx, sy
+                lc = None
+                continue
+        rel = cmd.islower()
+        c = cmd.upper()
+        if c == "M":
+            a, b = take(2)
+            x, y = (x + a, y + b) if rel else (a, b)
+            path.moveTo(x, y)
+            sx, sy = x, y
+            cmd = "l" if rel else "L"
+            lc = None
+        elif c == "L":
+            a, b = take(2)
+            x, y = (x + a, y + b) if rel else (a, b)
+            path.lineTo(x, y)
+            lc = None
+        elif c == "H":
+            (a,) = take(1)
+            x = x + a if rel else a
+            path.lineTo(x, y)
+            lc = None
+        elif c == "V":
+            (a,) = take(1)
+            y = y + a if rel else a
+            path.lineTo(x, y)
+            lc = None
+        elif c == "C":
+            v = take(6)
+            if rel:
+                v = [v[0] + x, v[1] + y, v[2] + x, v[3] + y, v[4] + x, v[5] + y]
+            path.cubicTo(v[0], v[1], v[2], v[3], v[4], v[5])
+            lc = (v[2], v[3])
+            x, y = v[4], v[5]
+        elif c == "S":
+            v = take(4)
+            if rel:
+                v = [v[0] + x, v[1] + y, v[2] + x, v[3] + y]
+            c1 = (2 * x - lc[0], 2 * y - lc[1]) if lc else (x, y)
+            path.cubicTo(c1[0], c1[1], v[0], v[1], v[2], v[3])
+            lc = (v[0], v[1])
+            x, y = v[2], v[3]
+        else:
+            break
+    return path
+
+
+THUMB_PATH = svg_path("M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06"
+                      "L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22"
+                      "l3.02-7.05c.09-.23.14-.47.14-.73v-2z")
+
+
+def _line(p, *pts):
+    path = QPainterPath(QPointF(*pts[0]))
+    for q in pts[1:]:
+        path.lineTo(QPointF(*q))
+    p.drawPath(path)
+
+
+def _ic_chevron(p, col):
+    _line(p, (6, 9), (12, 15), (18, 9))
+
+
+def _ic_close(p, col):
+    _line(p, (6.5, 6.5), (17.5, 17.5))
+    _line(p, (17.5, 6.5), (6.5, 17.5))
+
+
+def _ic_check(p, col):
+    _line(p, (5, 12.5), (10, 17.5), (19, 7))
+
+
+def _ic_sun(p, col):
+    p.setBrush(col)
+    p.drawEllipse(QPointF(12, 12), 4.2, 4.2)
+    import math
+    for k in range(8):
+        a = k * math.pi / 4
+        _line(p, (12 + 7.2 * math.cos(a), 12 + 7.2 * math.sin(a)), (12 + 9.8 * math.cos(a), 12 + 9.8 * math.sin(a)))
+
+
+def _ic_moon(p, col):
+    a = QPainterPath()
+    a.addEllipse(QPointF(11.5, 12.5), 8.2, 8.2)
+    b = QPainterPath()
+    b.addEllipse(QPointF(16.2, 8.6), 7.2, 7.2)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    p.drawPath(a.subtracted(b))
+
+
+def _ic_calendar(p, col):
+    p.drawRoundedRect(QRectF(4, 5.5, 16, 14.5), 3, 3)
+    _line(p, (4, 10), (20, 10))
+    _line(p, (8.5, 3.2), (8.5, 7))
+    _line(p, (15.5, 3.2), (15.5, 7))
+
+
+def _ic_clock(p, col):
+    p.drawEllipse(QPointF(12, 12), 8.3, 8.3)
+    _line(p, (12, 7), (12, 12), (15.6, 14))
+
+
+def _ic_eye(p, col):
+    path = QPainterPath(QPointF(2, 12))
+    path.cubicTo(6, 5, 18, 5, 22, 12)
+    path.cubicTo(18, 19, 6, 19, 2, 12)
+    p.drawPath(path)
+    p.drawEllipse(QPointF(12, 12), 3.2, 3.2)
+
+
+def _ic_thumb(p, col):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    p.drawPath(THUMB_PATH)
+
+
+def _ic_comment(p, col):
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(3, 4, 18, 13.5), 3.5, 3.5)
+    tail = QPainterPath(QPointF(7.5, 16))
+    tail.lineTo(7.5, 21.5)
+    tail.lineTo(13.5, 16)
+    tail.closeSubpath()
+    p.drawPath(path.united(tail))
+
+
+def _ic_download(p, col):
+    _line(p, (12, 4), (12, 15))
+    _line(p, (7, 10.8), (12, 15.8), (17, 10.8))
+    _line(p, (5, 20), (19, 20))
+
+
+def _ic_history(p, col):
+    for y in (6.3, 12, 17.7):
+        _line(p, (3.2, y), (4.7, y + 1.5), (7.4, y - 2))
+        _line(p, (11, y), (20.8, y))
+
+
+def _ic_question(p, col):
+    p.setPen(col)
+    f = QFont(STYLE["family"])
+    f.setPixelSize(20)
+    f.setWeight(QFont.Weight.Bold)
+    p.setFont(f)
+    p.drawText(QRectF(0, -0.5, 24, 24), Qt.AlignmentFlag.AlignCenter, "?")
+
+
+def _ic_folder(p, col):
+    path = QPainterPath(QPointF(3, 7.5))
+    for q in ((9, 7.5), (11, 9.5), (21, 9.5), (21, 19), (3, 19)):
+        path.lineTo(QPointF(*q))
+    path.closeSubpath()
+    p.drawPath(path)
+
+
+def _ic_globe(p, col):
+    p.drawEllipse(QPointF(12, 12), 8.6, 8.6)
+    p.drawEllipse(QPointF(12, 12), 3.8, 8.6)
+    _line(p, (3.4, 12), (20.6, 12))
+
+
+def _ic_code(p, col):
+    _line(p, (8, 7), (3, 12), (8, 17))
+    _line(p, (16, 7), (21, 12), (16, 17))
+    _line(p, (13.6, 5), (10.4, 19))
+
+
+def _ic_info(p, col):
+    p.drawEllipse(QPointF(12, 12), 8.8, 8.8)
+    _line(p, (12, 11), (12, 16.6))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(col)
+    p.drawEllipse(QPointF(12, 7.9), 1.3, 1.3)
+
+
+def _ic_clipboard(p, col):
+    p.drawRoundedRect(QRectF(5.5, 5, 13, 15.5), 2.5, 2.5)
+    p.drawRoundedRect(QRectF(9, 2.8, 6, 4.4), 1.5, 1.5)
+
+
+ICONS = dict(chevron=(_ic_chevron, 2.6), close=(_ic_close, 2.6), check=(_ic_check, 2.8), sun=(_ic_sun, 2.0),
+             moon=(_ic_moon, 2.0), calendar=(_ic_calendar, 2.0), clock=(_ic_clock, 2.0), eye=(_ic_eye, 2.0),
+             thumb=(_ic_thumb, 2.0), comment=(_ic_comment, 2.0), download=(_ic_download, 2.6),
+             history=(_ic_history, 2.0), question=(_ic_question, 2.0), folder=(_ic_folder, 2.0),
+             globe=(_ic_globe, 2.0), code=(_ic_code, 2.0), info=(_ic_info, 2.0), clipboard=(_ic_clipboard, 2.0))
+
+
+def paint_icon(p, name, rect, color):
+    fn, w = ICONS[name]
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.translate(rect.topLeft())
+    s = min(rect.width(), rect.height()) / 24.0
+    p.scale(s, s)
+    p.setPen(QPen(color, w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    fn(p, color)
+    p.restore()
+
+
+def rounded_path(rect, r):
+    path = QPainterPath()
+    path.addRoundedRect(QRectF(rect), r, r)
+    return path
+
+
+def draw_shadow(p, rect, radius, strength=1.0):
+    p.setPen(Qt.PenStyle.NoPen)
+    for i, a in enumerate((16, 11, 7, 4)):
+        p.setBrush(QColor(0, 0, 0, int(a * strength) if STYLE["theme"] == "light" else int(a * 2 * strength)))
+        p.drawRoundedRect(QRectF(rect).adjusted(-i * 0.3, i * 0.6 + 0.8, i * 0.3, i * 0.9 + 1.4), radius, radius)
+
+
+def red_gradient(rect):
+    top, mid, bot = accent_trio()
+    g = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+    g.setColorAt(0.0, top)
+    g.setColorAt(0.55, mid)
+    g.setColorAt(1.0, bot)
+    return g
+
+
+# ---------------------------------------------------------------- basic widgets
+class ElidedLabel(QLabel):
+    def __init__(self, text="", lines=1):
+        super().__init__()
+        self._full, self._lines = text, lines
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+        self.setWordWrap(lines > 1)
+        self.setText(text)
+
+    def set_full(self, text):
+        self._full = text or ""
+        self.setToolTip(self._full if len(self._full) > 24 else "")
+        self._elide()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._elide()
+
+    def _elide(self):
+        w = max(20, self.width())
+        fm = self.fontMetrics()
+        t = self._full
+        if self._lines <= 1:
+            self.setText(fm.elidedText(t, Qt.TextElideMode.ElideRight, w))
+            return
+        limit = fm.lineSpacing() * self._lines + 2
+        flags = int(Qt.TextFlag.TextWordWrap)
+        if fm.boundingRect(QRect(0, 0, w, 10000), flags, t).height() <= limit:
+            self.setText(t)
+            return
+        lo, hi = 0, len(t)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fm.boundingRect(QRect(0, 0, w, 10000), flags, t[:mid].rstrip() + "…").height() <= limit:
+                lo = mid
+            else:
+                hi = mid - 1
+        self.setText(t[:lo].rstrip() + "…")
+
+
+class PillButton(QAbstractButton):
+    """kind: white | gray | red | round | roundgray | ghost"""
+    def __init__(self, text="", icon="", kind="white", chev=False, h=26, size=11, bold=False, pad=12):
+        super().__init__()
+        self._icon, self._kind, self._chev, self._h, self._pad = icon, kind, chev, h, pad
+        self._size, self._bold = size, bold
+        self._hover = False
+        self._dark = False
+        self.setText(text)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(px(h) + 3)
+        self.refit()
+
+    def set_label(self, text, icon=None):
+        self.setText(text)
+        if icon is not None:
+            self._icon = icon
+        self.refit()
+        self.update()
+
+    def refit(self):
+        f = mkfont(self._size, QFont.Weight.Bold if self._bold else QFont.Weight.DemiBold)
+        self.setFont(f)
+        if self._kind.startswith("round"):
+            self.setFixedWidth(px(self._h) + 0)
+            return
+        w = px(self._pad) * 2
+        fm = QFontMetrics(f)
+        if self.text():
+            w += fm.horizontalAdvance(self.text())
+        if self._icon:
+            w += px(14) + (px(6) if self.text() else 0)
+        if self._chev:
+            w += px(9) + px(5)
+        if not self.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored:
+            self.setMinimumWidth(w)
+        self._hint = w
+        self.updateGeometry()
+
+    def sizeHint(self):
+        return QSize(getattr(self, "_hint", px(60)), self.height())
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if not self.isEnabled():
+            p.setOpacity(0.5)
+        r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
+        rad = r.height() / 2
+        kind = "red" if (self.isCheckable() and self.isChecked()) else self._kind
+        fg = C("text")
+        if kind in ("white", "round"):
+            draw_shadow(p, r, rad, 0.8)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(C("pill_hover") if self._hover else C("pill"))
+            p.drawRoundedRect(r, rad, rad)
+        elif kind in ("gray", "roundgray"):
+            p.setPen(Qt.PenStyle.NoPen)
+            col = C("gray")
+            p.setBrush(col.lighter(106) if self._hover else col)
+            p.drawRoundedRect(r, rad, rad)
+            fg = C("gray_text")
+        elif kind == "red":
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(0, 0, 0, 40))
+            p.drawRoundedRect(r.adjusted(0, 1.2, 0, 1.6), rad, rad)
+            g = red_gradient(r)
+            p.setBrush(g)
+            p.setPen(QPen(accent_trio()[2].darker(115), 1))
+            p.drawRoundedRect(r, rad, rad)
+            hl = QLinearGradient(r.topLeft(), QPointF(r.left(), r.top() + r.height() * 0.55))
+            hl.setColorAt(0, QColor(255, 255, 255, 70 if not self._hover else 95))
+            hl.setColorAt(1, QColor(255, 255, 255, 0))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(hl)
+            p.drawRoundedRect(r.adjusted(1, 1, -1, -1), rad - 1, rad - 1)
+            fg = QColor("#ffffff")
+        else:  # ghost
+            fg = C("text") if (self._hover or self._dark) else C("sub")
+        fm = QFontMetrics(self.font())
+        isz = px(14)
+        if kind.startswith("round"):
+            if self._icon:
+                s = min(r.width(), r.height()) * 0.52
+                paint_icon(p, self._icon, QRectF(r.center().x() - s / 2, r.center().y() - s / 2, s, s), fg)
+            return
+        tw = fm.horizontalAdvance(self.text()) if self.text() else 0
+        total = tw + (isz + (px(6) if tw else 0) if self._icon else 0) + ((px(9) + px(5)) if self._chev else 0)
+        x = r.left() + (r.width() - total) / 2
+        cy = r.center().y()
+        if self._icon:
+            paint_icon(p, self._icon, QRectF(x, cy - isz / 2, isz, isz), fg)
+            x += isz + (px(6) if tw else 0)
+        if tw:
+            p.setPen(fg)
+            p.setFont(self.font())
+            p.drawText(QRectF(x, r.top(), tw + 2, r.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+            x += tw
+        if self._chev:
+            s = px(9)
+            paint_icon(p, "chevron", QRectF(x + px(5), cy - s / 2 + 0.5, s, s), fg)
+
+
+class LinkButton(QAbstractButton):
+    def __init__(self, text, chev=False):
+        super().__init__()
+        self._chev, self._hover, self.active = chev, False, False
+        self.setText(text)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.refit()
+
+    def refit(self):
+        self.setFont(mkfont(12, QFont.Weight.DemiBold))
+        w = QFontMetrics(self.font()).horizontalAdvance(self.text()) + px(22) + (px(14) if self._chev else 0)
+        self.setFixedSize(w, px(30))
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        col = C("text") if (self._hover or self.active) else C("sub")
+        f = mkfont(12, QFont.Weight.Bold if self.active else QFont.Weight.DemiBold)
+        p.setFont(f)
+        p.setPen(col)
+        tw = QFontMetrics(f).horizontalAdvance(self.text())
+        total = tw + (px(14) if self._chev else 0)
+        x = (self.width() - total) / 2
+        p.drawText(QRectF(x, 0, tw + 2, self.height()), Qt.AlignmentFlag.AlignVCenter, self.text())
+        if self._chev:
+            s = px(9)
+            paint_icon(p, "chevron", QRectF(x + tw + px(5), self.height() / 2 - s / 2 + 1, s, s), col)
+
+
+class Surface(QWidget):
+    """White pill / card with soft shadow."""
+    def __init__(self, radius=None, h=None):
+        super().__init__()
+        self._radius = radius
+        if h:
+            self.setFixedHeight(px(h) + 3)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
+        rad = self._radius if self._radius else r.height() / 2
+        draw_shadow(p, r, rad)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(C("pill") if self._radius is None else C("card"))
+        p.drawRoundedRect(r, rad, rad)
+
+
+class Chip(QWidget):
+    def __init__(self, icon, text=""):
+        super().__init__()
+        self.icon, self.text = icon, text
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.refit()
+
+    def set_text(self, t):
+        self.text = t
+        self.refit()
+        self.update()
+
+    def refit(self):
+        f = mkfont(9, QFont.Weight.DemiBold)
+        w = QFontMetrics(f).horizontalAdvance(self.text) + px(8) * 2 + px(10) + px(4)
+        self.setFixedSize(w, px(18))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect())
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(C("chip"))
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        col = C("chip_text")
+        s = px(10)
+        paint_icon(p, self.icon, QRectF(px(8), r.center().y() - s / 2, s, s), col)
+        p.setPen(col)
+        p.setFont(mkfont(9, QFont.Weight.DemiBold))
+        p.drawText(QRectF(px(8) + s + px(4), 0, r.width(), r.height()), Qt.AlignmentFlag.AlignVCenter, self.text)
+
+
+class LogoMark(QWidget):
+    def __init__(self, size=17):
+        super().__init__()
+        self.setFixedSize(px(size), px(size))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        p.translate(w / 2, w / 2)
+        p.rotate(45)
+        s = w * 0.62
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#17181b") if STYLE["theme"] == "light" else QColor("#f3f3f5"))
+        p.drawRoundedRect(QRectF(-s / 2, -s / 2, s, s), s * 0.22, s * 0.22)
+        p.rotate(-45)
+        paint_icon(p, "download", QRectF(-w * 0.2, -w * 0.2, w * 0.4, w * 0.4),
+                   QColor("#ffffff") if STYLE["theme"] == "light" else QColor("#17181b"))
+
+
+class SourceIcon(QWidget):
+    """Small red circle with a download arrow (inside the downloader pill)."""
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(px(18), px(18))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(red_gradient(r))
+        p.drawEllipse(r)
+        s = r.width() * 0.52
+        paint_icon(p, "download", QRectF(r.center().x() - s / 2, r.center().y() - s / 2, s, s), QColor("#fff"))
+
+
+class ThemeToggle(QAbstractButton):
+    def __init__(self):
+        super().__init__()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setFixedSize(px(54), px(32) + 3)
+        self.setToolTip("Light / dark")
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
+        draw_shadow(p, r, r.height() / 2)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(C("pill"))
+        p.drawRoundedRect(r, r.height() / 2, r.height() / 2)
+        light = STYLE["theme"] == "light"
+        inset = px(3)
+        kw = r.width() / 2 - inset
+        kx = r.left() + inset if light else r.right() - inset - kw
+        kr = QRectF(kx, r.top() + inset, kw, r.height() - 2 * inset)
+        p.setBrush(red_gradient(kr))
+        p.drawRoundedRect(kr, kr.height() / 2, kr.height() / 2)
+        s = px(13)
+        lr = QRectF(r.left() + inset + (kw - s) / 2, r.center().y() - s / 2, s, s)
+        rr = QRectF(r.right() - inset - kw + (kw - s) / 2, r.center().y() - s / 2, s, s)
+        paint_icon(p, "sun", lr, QColor("#fff") if light else C("sub"))
+        paint_icon(p, "moon", rr, C("sub") if light else QColor("#fff"))
+
+
+# ---------------------------------------------------------------- window panel
+class Panel(QWidget):
+    """The glass panel: the whole window is this light-gray (or dark) gradient."""
+    def theme_changed(self):
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        g = QLinearGradient(QPointF(0, 0), QPointF(0, self.height()))
+        g.setColorAt(0.0, C("panel_top"))
+        g.setColorAt(1.0, C("panel_bot"))
+        p.fillRect(self.rect(), g)
+        p.setPen(QPen(QColor(255, 255, 255, 190 if STYLE["theme"] == "light" else 40), 1))
+        p.drawRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5))
+
+
+class StripWidget(QWidget):
+    """Gray glass strip at the bottom of the result card (blurred thumbnail behind the controls)."""
+    def __init__(self):
+        super().__init__()
+        self.thumb = None
+
+    def set_thumb(self, pix):
+        self.thumb = pix
+        self.update()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0, 0, 0, -1)
+        rad = px(16)
+        path = rounded_path(r, rad)
+        p.setClipPath(path)
+        g = QLinearGradient(r.topLeft(), r.bottomLeft())
+        g.setColorAt(0, C("strip_top"))
+        g.setColorAt(1, C("strip_bot"))
+        p.fillRect(r, g)
+        if self.thumb is not None and not self.thumb.isNull():
+            s = self.thumb.scaled(max(1, int(r.width() // 18)), max(1, int(r.height() // 18)),
+                                  Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            s = s.scaled(int(r.width()), int(r.height()), Qt.AspectRatioMode.IgnoreAspectRatio,
+                         Qt.TransformationMode.SmoothTransformation)
+            p.setOpacity(0.32)
+            p.drawPixmap(0, 0, s)
+            p.setOpacity(1)
+            p.fillRect(r, QColor(140, 140, 140, 90))
+        else:
+            n = 16
+            for i in range(n):
+                a = 14 + (i * 37) % 26
+                p.fillRect(QRectF(r.width() * i / n, 0, r.width() / n * 0.5, r.height()), QColor(255, 255, 255, a))
+
+
+def rounded_pix(pix, w, h, r, dpr=1.0):
+    W, H = int(w * dpr), int(h * dpr)
+    pix = pix.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
+    out = QPixmap(W, H)
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setClipPath(rounded_path(QRectF(0, 0, W, H), r * dpr))
+    p.drawPixmap((W - pix.width()) // 2, (H - pix.height()) // 2, pix)
+    p.end()
+    out.setDevicePixelRatio(dpr)
+    return out
+
+
+# ---------------------------------------------------------------- helpers
+def fmt_size(n):
+    mb = n / 1048576.0
+    return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+
+
+def fmt_count(n):
+    try:
+        n = float(n)
+    except Exception:
+        return ""
+    for lim, suf in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if n >= lim:
+            v = n / lim
+            return (f"{v:.1f}".rstrip("0").rstrip(".") if v < 100 else f"{v:.0f}") + suf
+    return str(int(n))
+
+
+def fmt_speed(bps):
+    try:
+        bps = float(bps)
+    except Exception:
+        return ""
+    return f"{bps / 1048576:.1f} MB/s" if bps >= 1048576 else f"{bps / 1024:.0f} KB/s"
+
+
+def fmt_eta(s):
+    try:
+        s = int(float(s))
+    except Exception:
+        return ""
+    h, r = divmod(s, 3600)
+    m, sec = divmod(r, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def fmt_duration(sec):
+    try:
+        sec = int(sec)
+    except Exception:
+        return ""
+    return fmt_eta(sec)
+
+
+def fmt_date(s):
+    s = str(s or "")
+    if len(s) >= 6 and s[:6].isdigit():
+        m = int(s[4:6])
+        if 1 <= m <= 12:
+            return f"{MONTHS[m - 1]} {s[:4]}"
+    return ""
+
+
+def num(v):
+    try:
+        f = float(v)
+        return f
+    except Exception:
+        return None
+
+
+def load_history():
+    try:
+        with open(HIST_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_history(items):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = HIST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items[:200], f, ensure_ascii=False, indent=1)
+        os.replace(tmp, HIST_FILE)
+    except Exception as e:
+        log_error("save_history: " + repr(e))
+
+
+# ---------------------------------------------------------------- engine (yt-dlp + JavaScript helper)
+def which_in_path(name):
+    return shutil.which(name, path=BIN_DIR + os.pathsep + os.environ.get("PATH", ""))
+
+
+def has_local_engine():
+    return os.path.isfile(LOCAL_YTDLP)
+
+
+def engine_cmd():
+    return LOCAL_YTDLP if has_local_engine() else (shutil.which("yt-dlp") or "yt-dlp")
+
+
+def engine_exists():
+    return has_local_engine() or shutil.which("yt-dlp") is not None
+
+
+def proc_env():
+    env = QProcessEnvironment.systemEnvironment()
+    env.insert("PATH", BIN_DIR + os.pathsep + env.value("PATH", ""))
+    env.insert("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def start_engine(proc, args):
+    """Start yt-dlp in its own process group so cancel/quit also stops aria2c/ffmpeg children."""
+    exe = engine_cmd()
+    if SETSID:
+        proc.start(SETSID, ["--", exe] + args)
+    else:
+        proc.start(exe, args)
+
+
+def kill_group(proc, sig):
+    pid = proc.processId()
+    try:
+        if pid and SETSID:
+            os.killpg(pid, sig)
+            return
+    except Exception:
+        pass
+    try:
+        proc.terminate() if sig == signal.SIGTERM else proc.kill()
+    except Exception:
+        pass
+
+
+def deno_name():
+    arch = platform.machine().lower()
+    return "deno-aarch64-unknown-linux-gnu.zip" if arch in ("aarch64", "arm64") else "deno-x86_64-unknown-linux-gnu.zip"
+
+
+def find_hash(text, name):
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == name and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            return parts[0].lower()
+    m = re.fullmatch(r"\s*([0-9a-fA-F]{64})\s*", text)
+    return m.group(1).lower() if m else ""
+
+
+class Engine(QObject):
+    status = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, nam):
+        super().__init__()
+        self.nam = nam
+        self.busy = False
+        self.want = ""
+
+    def run(self):
+        if self.busy:
+            return
+        self.busy = True
+        try:
+            os.makedirs(BIN_DIR, exist_ok=True)
+        except Exception as e:
+            self.fail(f"Couldn't create the engine folder: {e}")
+            return
+        self.status.emit("Checking the download engine…")
+        self.get(YTDLP_SUMS_URL, "checksums", self.got_sums)
+
+    def get(self, url, label, cb):
+        req = QNetworkRequest(QUrl(url))
+        req.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                         QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
+        req.setTransferTimeout(60000)
+        reply = self.nam.get(req)
+        reply.downloadProgress.connect(
+            lambda r, t, l=label: self.status.emit(f"Updating {l}… {int(r * 100 / t)}%" if t > 0 and l != "checksums" else f"Updating {l}…"))
+        reply.finished.connect(lambda r=reply: cb(r))
+
+    def fail(self, msg):
+        self.busy = False
+        self.status.emit(msg)
+        self.finished.emit(False, msg)
+
+    def take(self, reply, what):
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self.fail(f"Couldn't download the {what}. Check your connection and try again.")
+                return None
+            return bytes(reply.readAll())
+        finally:
+            reply.deleteLater()
+
+    def got_sums(self, reply):
+        data = self.take(reply, "engine checksums")
+        if data is None:
+            return
+        self.want = find_hash(data.decode("utf-8", "replace"), "yt-dlp")
+        if not self.want:
+            self.fail("Couldn't verify the download engine (no checksum found). Nothing was installed.")
+            return
+        self.get(YTDLP_URL, "download engine", self.got_ytdlp)
+
+    def got_ytdlp(self, reply):
+        data = self.take(reply, "engine")
+        if data is None:
+            return
+        if len(data) < 100000 or hashlib.sha256(data).hexdigest() != self.want:
+            self.fail("The engine download failed its integrity check. Nothing was installed.")
+            return
+        try:
+            tmp = LOCAL_YTDLP + ".new"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, LOCAL_YTDLP)
+        except Exception as e:
+            self.fail(f"Couldn't save the engine: {e}")
+            return
+        if which_in_path("deno"):
+            self.done()
+        else:
+            self.get("https://github.com/denoland/deno/releases/latest/download/" + deno_name() + ".sha256sum",
+                     "checksums", self.got_deno_sum)
+
+    def got_deno_sum(self, reply):
+        data = self.take(reply, "JavaScript helper checksum")
+        if data is None:
+            return
+        self.want = find_hash(data.decode("utf-8", "replace"), deno_name())
+        if not self.want:
+            self.fail("Couldn't verify the JavaScript helper (no checksum found). It was not installed.")
+            return
+        self.get("https://github.com/denoland/deno/releases/latest/download/" + deno_name(),
+                 "JavaScript helper", self.got_deno)
+
+    def got_deno(self, reply):
+        data = self.take(reply, "JavaScript helper")
+        if data is None:
+            return
+        if hashlib.sha256(data).hexdigest() != self.want:
+            self.fail("The JavaScript helper failed its integrity check. It was not installed.")
+            return
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                with z.open("deno") as src, open(LOCAL_DENO + ".new", "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            os.chmod(LOCAL_DENO + ".new", 0o755)
+            os.replace(LOCAL_DENO + ".new", LOCAL_DENO)
+        except Exception as e:
+            self.fail(f"Couldn't set up the JavaScript helper: {e}")
+            return
+        self.done()
+
+    def done(self):
+        self.busy = False
+        self.status.emit("Engine is up to date")
+        self.finished.emit(True, "Engine is up to date")
+
+
+# ---------------------------------------------------------------- self-update (GitHub)
+def vtuple(v):
+    try:
+        return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4])
+    except Exception:
+        return (0,)
+
+
+def read_file_version(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = re.search(r'^VERSION = "([^"]+)"', f.read(8192), re.M)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
+
+
+def maybe_run_newer():
+    """Run the copy downloaded by the updater if it is newer than the installed one.
+    A downloaded version that never reached a working window is discarded on the next start."""
+    if os.environ.get("REDGET_NO_OVERRIDE"):
+        return
+    try:
+        if os.path.isfile(APP_PENDING):
+            bad = read_file_version(APP_FILE)
+            shutil.rmtree(APP_DIR, ignore_errors=True)
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(SKIP_FILE, "w") as f:
+                f.write(bad)
+            log_error(f"downloaded version {bad} did not start cleanly; using the installed version")
+            return
+        if not os.path.isfile(APP_FILE):
+            return
+        if os.path.realpath(APP_FILE) == os.path.realpath(os.path.abspath(__file__)):
+            return
+        v = read_file_version(APP_FILE)
+        if v and vtuple(v) > vtuple(VERSION):
+            with open(APP_PENDING, "w") as f:
+                f.write(v)
+            os.execv(sys.executable, [sys.executable, APP_FILE] + sys.argv[1:])
+        else:
+            shutil.rmtree(APP_DIR, ignore_errors=True)
+    except Exception as e:
+        log_error("maybe_run_newer: " + repr(e))
+
+
+class SelfUpdater(QObject):
+    """Checks version.json in the GitHub repo; downloads, verifies (SHA-256 + syntax) and stores a new redget."""
+    state = pyqtSignal(str, str)   # kind: checking | uptodate | installed | error, text
+
+    def __init__(self, nam):
+        super().__init__()
+        self.nam = nam
+        self.busy = False
+        self.manual = False
+        self.meta = {}
+
+    def check(self, manual=False):
+        if self.busy:
+            return
+        self.busy, self.manual = True, manual
+        if manual:
+            self.state.emit("checking", "Checking for updates…")
+        self.get(UPDATE_RAW + "version.json", self.got_meta)
+
+    def get(self, url, cb):
+        req = QNetworkRequest(QUrl(url))
+        req.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                         QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
+        req.setRawHeader(b"Cache-Control", b"no-cache")
+        req.setTransferTimeout(30000)
+        reply = self.nam.get(req)
+        reply.finished.connect(lambda r=reply: cb(r))
+
+    def fail(self, msg):
+        self.busy = False
+        if self.manual:
+            self.state.emit("error", msg)
+        else:
+            log_error("self-update: " + msg)
+
+    def got_meta(self, reply):
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self.fail("Couldn't reach GitHub. Check your connection.")
+                return
+            meta = json.loads(bytes(reply.readAll()).decode("utf-8"))
+            ver, sha = str(meta["version"]), str(meta["sha256"]).lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                raise ValueError("bad checksum field")
+        except Exception as e:
+            self.fail(f"The update information is not valid ({e}).")
+            return
+        finally:
+            reply.deleteLater()
+        skip = ""
+        try:
+            with open(SKIP_FILE) as f:
+                skip = f.read().strip()
+        except Exception:
+            pass
+        current = max((vtuple(VERSION), vtuple(read_file_version(APP_FILE))))
+        if vtuple(ver) <= current or (ver == skip and not self.manual):
+            self.busy = False
+            if self.manual:
+                self.state.emit("uptodate", f"RedGet {VERSION} is up to date")
+            return
+        self.meta = dict(version=ver, sha256=sha, file=str(meta.get("file", "redget")))
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", self.meta["file"]):
+            self.fail("The update information is not valid (file name).")
+            return
+        self.state.emit("checking", f"Downloading RedGet {ver}…")
+        self.get(UPDATE_RAW + self.meta["file"], self.got_file)
+
+    def got_file(self, reply):
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                self.fail("Couldn't download the update.")
+                return
+            data = bytes(reply.readAll())
+        finally:
+            reply.deleteLater()
+        try:
+            if hashlib.sha256(data).hexdigest() != self.meta["sha256"]:
+                self.fail("The update failed its integrity check. It was not installed.")
+                return
+            compile(data, "redget", "exec")
+            m = re.search(rb'^VERSION = "([^"]+)"', data[:8192], re.M)
+            if not m or m.group(1).decode() != self.meta["version"]:
+                self.fail("The update doesn't match its announced version. It was not installed.")
+                return
+            os.makedirs(APP_DIR, exist_ok=True)
+            tmp = APP_FILE + ".new"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, APP_FILE)
+            try:
+                os.remove(SKIP_FILE)
+            except OSError:
+                pass
+        except Exception as e:
+            self.fail(f"Couldn't install the update: {e}")
+            return
+        self.busy = False
+        self.state.emit("installed", self.meta["version"])
+
+
+# ---------------------------------------------------------------- link info
+SITE_NAMES = {"youtube": "YouTube", "tiktok": "TikTok", "twitter": "X", "instagram": "Instagram",
+              "facebook": "Facebook", "vimeo": "Vimeo", "soundcloud": "SoundCloud", "twitch": "Twitch",
+              "reddit": "Reddit", "dailymotion": "Dailymotion", "bilibili": "Bilibili"}
+
+
+def parse_probe(raw, url):
+    info = json.loads(raw)
+    ent, count = info, None
+    is_playlist = "list=" in url
+    title = ""
+    if info.get("_type") == "playlist":
+        is_playlist = True
+        ents = [e for e in (info.get("entries") or []) if e]
+        ent = ents[0] if ents else {}
+        count = info.get("playlist_count") or info.get("n_entries")
+        title = info.get("title") or ""
+    title = title or ent.get("title") or ""
+    site = str(ent.get("extractor") or info.get("extractor") or "").split(":")[0].lower()
+    dur = ent.get("duration_string") or fmt_duration(ent.get("duration")) or ""
+    return dict(title=title, uploader=ent.get("uploader") or ent.get("channel") or info.get("uploader") or "",
+                duration=dur, thumb=ent.get("thumbnail") or info.get("thumbnail") or "",
+                formats=ent.get("formats") or [], playlist=is_playlist, count=count,
+                pure_playlist=(info.get("_type") == "playlist" and "v=" not in url),
+                site=SITE_NAMES.get(site, site.capitalize() if site and site != "generic" else ""),
+                date=fmt_date(ent.get("upload_date")), views=ent.get("view_count"),
+                likes=ent.get("like_count"), comments=ent.get("comment_count"))
+
+
+def quality_items(formats):
+    """-> list of (label, payload, size_bytes)"""
+    items = []
+    sizes, audio = {}, 0
+    for f in formats:
+        size = f.get("filesize") or f.get("filesize_approx") or 0
+        h = f.get("height")
+        if f.get("vcodec") not in (None, "none") and h:
+            sizes[int(h)] = max(sizes.get(int(h), 0), size)
+        elif f.get("acodec") not in (None, "none"):
+            audio = max(audio, size)
+    heights = sorted(sizes, reverse=True) if sizes else GENERIC_HEIGHTS
+    for h in heights:
+        if h < 144:
+            continue
+        label = f"{h}p" + (" (4K)" if h == 2160 else "")
+        items.append((label, ("video", h), (sizes.get(h, 0) + audio) if sizes.get(h) else 0))
+    for label, ext in AUDIO_CHOICES:
+        items.append((label, ("audio", ext), 0))
+    return items
+
+
+def default_quality(items):
+    for i, (_l, pl, _s) in enumerate(items):
+        if pl[0] == "video" and pl[1] <= 1080:
+            return i
+    return 0
+
+
+# ---------------------------------------------------------------- download jobs
+class JobWidget(QWidget):
+    def __init__(self, url):
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(px(16), px(10), px(12), px(13))
+        lay.setSpacing(px(5))
+        top = QHBoxLayout()
+        self.title = ElidedLabel(url)
+        self.title.setFont(mkfont(11.5, QFont.Weight.Bold))
+        self.btn = PillButton("", "close", "roundgray", h=22)
+        top.addWidget(self.title, 1)
+        top.addWidget(self.btn)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(px(6))
+        self.status = ElidedLabel("Waiting")
+        self.status.setFont(mkfont(10))
+        self.status.setProperty("role", "muted")
+        lay.addLayout(top)
+        lay.addWidget(self.bar)
+        lay.addWidget(self.status)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
+        draw_shadow(p, r, px(16))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(C("card"))
+        p.drawRoundedRect(r, px(16), px(16))
+
+    def set_title(self, text):
+        self.title.set_full(text)
+
+    def set_status(self, text):
+        self.status.set_full(text)
+
+
+class Job(QObject):
+    done = pyqtSignal(object, str)
+
+    def __init__(self, url, args, fallback, outdir, kind, widget, playlist):
+        super().__init__()
+        self.url, self.args, self.fallback, self.outdir, self.kind = url, args, fallback, outdir, kind
+        self.w, self.playlist = widget, playlist
+        self.proc = None
+        self.buf = ""
+        self.idx, self.total = 1, 1
+        self.streams, self.stream_idx, self.last_fn = 1, 0, None
+        self.cancelled = False
+        self.retried = False
+        self.ended = False
+        self.state = "queued"
+        self.title = url
+        self.dest = ""
+        self.err = ""
+
+    def start(self):
+        self.state = "running"
+        if not engine_exists():
+            self.err = "The download engine is missing. Set it up from the bar below."
+            self.finish("fail")
+            return
+        if self.proc is not None:
+            self.proc.deleteLater()
+        self.buf = ""
+        self.proc = QProcess(self)
+        self.proc.setProcessEnvironment(proc_env())
+        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self.read)
+        self.proc.finished.connect(self.finished)
+        self.proc.errorOccurred.connect(self.errored)
+        self.w.set_status("Starting…")
+        start_engine(self.proc, self.args + ["--", self.url])
+
+    def read(self):
+        self.buf += bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
+        parts = re.split(r"[\r\n]+", self.buf)
+        self.buf = parts.pop()
+        if len(self.buf) > 20000:
+            self.buf = ""
+        for line in parts:
+            line = line.strip()
+            if line:
+                self.handle(line)
+
+    def handle(self, line):
+        if line.startswith("RG_DL" + SEP):
+            f = line.split(SEP)
+            if len(f) < 7:
+                return
+            down = num(f[1])
+            tot = num(f[2]) or num(f[3])
+            fn = f[6]
+            if self.last_fn is not None and fn != self.last_fn and self.stream_idx < self.streams - 1:
+                self.stream_idx += 1
+            self.last_fn = fn
+            pct = max(0.0, min(1.0, down / tot)) if (down is not None and tot) else 0.0
+            overall = ((self.idx - 1) + (self.stream_idx + pct) / max(self.streams, 1)) / max(self.total, 1)
+            self.w.bar.setValue(int(overall * 1000))
+            txt = f"{pct * 100:.0f}%" if tot else "Downloading…"
+            if self.total > 1:
+                txt = f"Video {self.idx} of {self.total}, " + txt
+            sp, eta = fmt_speed(num(f[4])), fmt_eta(num(f[5]))
+            if sp:
+                txt += f", {sp}"
+            if eta:
+                txt += f", {eta} left"
+            self.w.set_status(txt)
+        elif line.startswith("RG_PP" + SEP):
+            f = line.split(SEP)
+            if len(f) >= 3 and f[2] == "started":
+                name = f[1]
+                self.w.set_status({"Merger": "Merging audio and video…", "ExtractAudio": "Converting audio…"}.get(name, "Finishing…"))
+        elif line.startswith("RG_ITEM" + SEP):
+            f = line.split(SEP)
+            if len(f) >= 5:
+                self.idx = int(num(f[1]) or 1)
+                self.total = int(num(f[2]) or 1)
+                self.streams = 2 if f[4] else 1
+                self.stream_idx, self.last_fn = 0, None
+                if f[3] and f[3] != "NA":
+                    self.title = f[3]
+                    self.w.set_title(f[3])
+                if self.total > 1:
+                    self.w.set_status(f"Video {self.idx} of {self.total}")
+        elif line.startswith("RG_DONE" + SEP):
+            self.dest = line.split(SEP, 1)[1]
+            self.title = os.path.basename(self.dest) or self.title
+            self.w.set_title(self.title)
+        elif line.startswith("ERROR"):
+            self.err = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", line)
+        elif "failed to execute" in line.lower() and not self.err:
+            self.err = "The download engine is missing. Set it up from the bar below."
+
+    def finish(self, state):
+        if self.ended:
+            return
+        self.ended = True
+        self.state = state
+        self.done.emit(self, state)
+
+    def finished(self, code, _status):
+        if self.buf.strip():
+            self.handle(self.buf.strip())
+            self.buf = ""
+        if self.cancelled:
+            self.finish("cancel")
+        elif code == 0:
+            self.finish("ok")
+        elif self.fallback and not self.retried:
+            self.retried = True
+            self.args = self.fallback
+            self.err = ""
+            self.idx, self.stream_idx, self.last_fn = 1, 0, None
+            self.w.bar.setValue(0)
+            self.w.set_status("Parallel mode was refused, trying a safer way…")
+            QTimer.singleShot(200, self.start)
+        else:
+            self.finish("fail")
+
+    def errored(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.err = "The download engine is missing. Set it up from the bar below."
+            self.finish("fail")
+
+    def cancel(self):
+        self.cancelled = True
+        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
+            kill_group(self.proc, signal.SIGTERM)
+            QTimer.singleShot(3000, self.kill_if_alive)
+
+    def kill_if_alive(self):
+        if self.proc and self.proc.state() != QProcess.ProcessState.NotRunning:
+            kill_group(self.proc, signal.SIGKILL)
+
+
+# ---------------------------------------------------------------- QSS
+def build_qss():
+    t = T()
+    acc = QColor(STYLE["accent"])
+    top, mid, bot = accent_trio()
+    check = os.path.join(CACHE_DIR, "check.png").replace("\\", "/")
+    return f"""
+* {{ font-family: "{STYLE['family']}"; }}
+QLabel {{ color: {t['text']}; background: transparent; }}
+QLabel[role="muted"] {{ color: {t['sub']}; }}
+QLabel[role="title"] {{ font-size: {px(20)}px; font-weight: 700; }}
+QLabel[role="section"] {{ font-size: {px(13)}px; font-weight: 700; }}
+QToolTip {{ background: {t['pill']}; color: {t['text']}; border: 1px solid {t['line']}; padding: {px(4)}px {px(7)}px; border-radius: {px(6)}px; }}
+QMenu {{ background: {t['pill']}; color: {t['text']}; border: 1px solid {t['line']}; border-radius: {px(14)}px; padding: {px(6)}px; }}
+QMenu::item {{ padding: {px(7)}px {px(20)}px {px(7)}px {px(14)}px; border-radius: {px(9)}px; font-size: {px(12)}px; font-weight: 600; }}
+QMenu::item:selected {{ background: {t['chip']}; }}
+QMenu::item:disabled {{ color: {t['sub']}; font-weight: 500; }}
+QMenu::separator {{ height: 1px; background: {t['line']}; margin: {px(5)}px {px(8)}px; }}
+QMenu::indicator {{ width: {px(14)}px; height: {px(14)}px; margin-left: {px(4)}px; }}
+QScrollArea {{ background: transparent; border: none; }}
+QScrollArea > QWidget > QWidget {{ background: transparent; }}
+QScrollBar:vertical {{ background: transparent; width: {px(9)}px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: rgba(120,120,120,0.45); border-radius: {px(3)}px; min-height: {px(30)}px; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QLineEdit {{ background: transparent; border: none; color: {t['text']}; selection-background-color: {STYLE['accent']}; selection-color: #ffffff; }}
+QLineEdit#field {{ background: {t['field']}; border: 1px solid {t['line']}; border-radius: {px(13)}px; padding: {px(7)}px {px(12)}px; font-size: {px(12)}px; }}
+QCheckBox {{ spacing: {px(8)}px; color: {t['text']}; font-size: {px(12)}px; font-weight: 600; }}
+QCheckBox::indicator {{ width: {px(18)}px; height: {px(18)}px; border-radius: {px(6)}px; border: 1px solid {t['line']}; background: {t['field']}; }}
+QCheckBox::indicator:checked {{ background: {STYLE['accent']}; border: 1px solid {STYLE['accent']}; image: url({check}); }}
+QProgressBar {{ background: {t['chip']}; border: none; border-radius: {px(3)}px; }}
+QProgressBar::chunk {{ border-radius: {px(3)}px; background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {mid.name()}, stop:1 {top.name()}); }}
+QListWidget#hist {{ background: transparent; border: none; outline: none; }}
+QListWidget#hist::item {{ background: {t['card']}; color: {t['text']}; border: 1px solid {t['line']}; border-radius: {px(14)}px; padding: {px(10)}px {px(14)}px; margin: {px(3)}px 0; font-size: {px(12)}px; }}
+QListWidget#hist::item:selected {{ border: 1px solid {STYLE['accent']}; color: {t['text']}; }}
+QMessageBox, QDialog {{ background: {t['card']}; }}
+QMessageBox QLabel {{ color: {t['text']}; font-size: {px(12)}px; }}
+QPushButton {{ background: {t['gray']}; color: {t['text']}; border: none; border-radius: {px(12)}px; padding: {px(7)}px {px(16)}px; font-weight: 600; }}
+QPushButton:hover {{ background: {t['chip']}; }}
+"""
+
+
+def make_check_png():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        pm = QPixmap(48, 48)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        paint_icon(p, "check", QRectF(6, 6, 36, 36), QColor("#ffffff"))
+        p.end()
+        pm.save(os.path.join(CACHE_DIR, "check.png"), "PNG")
+    except Exception as e:
+        log_error("check.png: " + repr(e))
+
+
+def mk_label(text, size=12, weight=QFont.Weight.Normal, role=None, align=None, wrap=False):
+    l = QLabel(text)
+    l.setFont(mkfont(size, weight))
+    if role:
+        l.setProperty("role", role)
+    if align is not None:
+        l.setAlignment(align)
+    l.setWordWrap(wrap)
+    return l
+
+
+# ---------------------------------------------------------------- main window
+class Main(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("RedGet")
+        self.setWindowIcon(QIcon.fromTheme("redget"))
+        self.settings = QSettings("redget", "redget")
+        self.jobs = []
+        self.current = None
+        self.history = load_history()
+        theme = str(self.settings.value("theme", "light"))
+        STYLE["theme"] = theme if theme in THEMES else "light"
+        acc = str(self.settings.value("accent", DEFAULT_ACCENT))
+        STYLE["accent"] = acc if QColor(acc).isValid() else DEFAULT_ACCENT
+        self.dir = str(self.settings.value("dir", DEFAULT_DIR) or DEFAULT_DIR)
+        self.last_clip = ""
+        self.clip_seen = ""
+        self.probe_proc = None
+        self.q_items = []
+        self.q_idx = 0
+        self.thumb_pix = None
+        self.engine_version = ""
+        self.notice_mode = "tip"
+        self.nam = QNetworkAccessManager(self)
+        self.engine = Engine(self.nam)
+        self.engine.status.connect(self.on_engine_status)
+        self.engine.finished.connect(self.on_engine_done)
+        self.updater = SelfUpdater(self.nam)
+        self.updater.state.connect(self.on_update_state)
+        self.update_ready = ""
+
+        self.bgw = Panel()
+        self.setCentralWidget(self.bgw)
+        self.frame = self.bgw
+        self.flay = QVBoxLayout(self.bgw)
+        self.flay.setSpacing(0)
+        self.flay.setContentsMargins(px(10), px(11), px(10), px(10))
+        self.flay.addLayout(self.build_nav())
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.build_download_page())
+        self.stack.addWidget(self.build_history_page())
+        self.stack.addWidget(self.build_settings_page())
+        self.flay.addWidget(self.stack, 1)
+        self.flay.addLayout(self.build_bottom())
+        self.phone = PhoneOverlay(self.frame)
+        self.refresh_history()
+        self.set_quality_items([])
+        self.apply_theme()
+        self.show_page(0)
+
+        self.clip = QGuiApplication.clipboard()
+        self.clip.dataChanged.connect(self.check_clipboard)
+        QGuiApplication.instance().applicationStateChanged.connect(self.on_app_state)
+        QTimer.singleShot(600, self.check_clipboard)
+        QTimer.singleShot(200, self.refresh_engine_state)
+        QTimer.singleShot(4000, self.mark_healthy)
+        QTimer.singleShot(8000, self.auto_check_update)
+        self.upd_timer = QTimer(self)
+        self.upd_timer.setInterval(6 * 3600 * 1000)
+        self.upd_timer.timeout.connect(self.auto_check_update)
+        self.upd_timer.start()
+        if has_local_engine():
+            try:
+                if time.time() - os.path.getmtime(LOCAL_YTDLP) > 7 * 86400:
+                    QTimer.singleShot(4000, self.engine.run)
+            except Exception:
+                pass
+
+    # ---------- window geometry
+    def place_overlay(self):
+        try:
+            pt = self.app_pill.mapTo(self.frame, QPoint(0, 0))
+            self.phone.move(pt.x() + px(12), pt.y() + self.app_pill.height() - 3 - self.phone.height() + px(1))
+            self.phone.raise_()
+        except RuntimeError:
+            pass
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self.place_overlay)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        QTimer.singleShot(0, self.place_overlay)
+
+    # ---------- self-update
+    def mark_healthy(self):
+        try:
+            os.remove(APP_PENDING)
+        except OSError:
+            pass
+
+    def auto_check_update(self):
+        if self.sbool("auto_update", True) and not self.update_ready:
+            self.updater.check(False)
+
+    def check_update_now(self):
+        self.updater.check(True)
+
+    def on_update_state(self, kind, text):
+        if kind == "installed":
+            self.update_ready = text
+            self.set_notice("update", f"RedGet {text} was downloaded and is ready to use.",
+                            ("Later", "close"), ("Restart", "check"))
+            if hasattr(self, "upd_label"):
+                self.upd_label.setText(f"RedGet {text} is ready. Restart to use it.")
+        elif hasattr(self, "upd_label"):
+            self.upd_label.setText(text)
+
+    def restart_app(self):
+        running = [j for j in self.jobs if j.state == "running"]
+        if running and QMessageBox.question(self, "Restart", "A download is still running. Restart anyway?") != QMessageBox.StandardButton.Yes:
+            return
+        self.close()
+        os.execv(sys.executable, [sys.executable, APP_FILE if os.path.isfile(APP_FILE) else os.path.abspath(__file__)] + sys.argv[1:])
+
+    # ---------- settings helpers
+    def sbool(self, key, default):
+        return str(self.settings.value(key, "true" if default else "false")).lower() == "true"
+
+    def parts_idx(self):
+        try:
+            return max(0, min(len(PARTS_CHOICES) - 1, int(self.settings.value("parts_idx", 2))))
+        except Exception:
+            return 2
+
+    def set_parts(self, i):
+        self.settings.setValue("parts_idx", i)
+        self.refresh_parts_ui()
+
+    def set_dir(self, d):
+        self.dir = d
+        self.settings.setValue("dir", d)
+        self.update_dir_ui()
+
+    def set_theme(self, key):
+        STYLE["theme"] = key
+        self.settings.setValue("theme", key)
+        self.apply_theme()
+
+    def set_accent(self, hexcolor):
+        STYLE["accent"] = hexcolor
+        self.settings.setValue("accent", hexcolor)
+        self.apply_theme()
+
+    def apply_theme(self):
+        app = QApplication.instance()
+        t = T()
+        pal = QPalette()
+        R = QPalette.ColorRole
+        pal.setColor(R.Window, QColor(t["panel_top"]))
+        pal.setColor(R.WindowText, QColor(t["text"]))
+        pal.setColor(R.Base, QColor(t["field"]))
+        pal.setColor(R.Text, QColor(t["text"]))
+        pal.setColor(R.Button, QColor(t["gray"]))
+        pal.setColor(R.ButtonText, QColor(t["text"]))
+        pal.setColor(R.PlaceholderText, QColor(t["sub"]))
+        pal.setColor(R.Highlight, QColor(STYLE["accent"]))
+        pal.setColor(R.HighlightedText, QColor("#ffffff"))
+        app.setPalette(pal)
+        app.setStyleSheet(build_qss())
+        self.bgw.theme_changed()
+        self.refresh_link_style()
+        self.refresh_swatches()
+        if hasattr(self, "theme_buttons"):
+            for key, b in self.theme_buttons.items():
+                b.setChecked(STYLE["theme"] == key)
+        for w in self.findChildren(QWidget):
+            w.update()
+
+    # ---------- nav
+    def build_nav(self):
+        row = QHBoxLayout()
+        row.setSpacing(px(7))
+        pill = Surface(h=32)
+        pl = QHBoxLayout(pill)
+        pl.setContentsMargins(px(12), 0, px(8), 3)
+        pl.setSpacing(px(2))
+        pl.addWidget(LogoMark(17))
+        pl.addSpacing(px(5))
+        name = mk_label("RedGet", 13, QFont.Weight.Bold)
+        pl.addWidget(name)
+        pl.addStretch(1)
+        self.nav_btns = []
+        for i, label in enumerate(("Download", "History", "Settings")):
+            b = LinkButton(label)
+            b.clicked.connect(lambda _=False, i=i: self.show_page(i))
+            self.nav_btns.append(b)
+            pl.addWidget(b)
+        self.help_btn = LinkButton("Help", chev=True)
+        self.help_btn.clicked.connect(self.open_help_menu)
+        pl.addWidget(self.help_btn)
+        row.addWidget(pill, 1)
+        self.folder_btn = PillButton("", "folder", "white", chev=True, h=32, size=11.5, pad=14)
+        self.folder_btn.clicked.connect(self.open_folder_menu)
+        row.addWidget(self.folder_btn)
+        self.toggle = ThemeToggle()
+        self.toggle.clicked.connect(lambda: self.set_theme("dark" if STYLE["theme"] == "light" else "light"))
+        row.addWidget(self.toggle)
+        return row
+
+    def show_page(self, i):
+        self.stack.setCurrentIndex(i)
+        for j, b in enumerate(self.nav_btns):
+            b.active = (j == i)
+            b.update()
+
+    def open_help_menu(self):
+        m = QMenu(self)
+        m.addAction("About RedGet", self.show_about)
+        m.addAction("FAQ", self.show_faq)
+        m.addAction("Supported sites", lambda: QDesktopServices.openUrl(QUrl(SUPPORTED_URL)))
+        m.addSeparator()
+        m.addAction("Check for RedGet updates", self.check_update_now)
+        m.addAction("Update download engine", self.engine.run)
+        m.addAction("Open the log file", self.open_log)
+        m.exec(self.help_btn.mapToGlobal(QPoint(0, self.help_btn.height() + px(4))))
+
+    def open_folder_menu(self):
+        m = QMenu(self)
+        m.addAction("Open the downloads folder", lambda: self.open_folder(self.dir))
+        m.addAction("Change folder…", self.browse)
+        m.exec(self.folder_btn.mapToGlobal(QPoint(0, self.folder_btn.height() + px(4))))
+
+    def open_log(self):
+        if os.path.isfile(LOG):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(LOG))
+        else:
+            QMessageBox.information(self, "Log", "No errors have been logged.")
+
+    def show_about(self):
+        QMessageBox.information(self, "About RedGet",
+                                f"<b>RedGet {VERSION}</b><br>Paste a link, see the video, pick a quality, download.<br><br>"
+                                f"Powered by yt-dlp, ffmpeg and aria2.")
+
+    def show_faq(self):
+        QMessageBox.information(
+            self, "FAQ",
+            "<b>How do I download?</b><br>Copy a link. RedGet shows the video; choose a quality and press Download.<br><br>"
+            "<b>YouTube says 403 or asks for a JavaScript helper.</b><br>Use Help, then Update download engine.<br><br>"
+            "<b>What does Download in parts do?</b><br>It splits a file into several connections to go faster. "
+            "Change it from the Video Downloader menu.<br><br>"
+            "<b>Where are my files?</b><br>In the folder shown at the top right of the window.")
+
+    # ---------- download page
+    def build_download_page(self):
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lay.addStretch(1)
+        crow = QHBoxLayout()
+        crow.addStretch(1)
+        col = QWidget()
+        col.setFixedWidth(px(510))
+        cl = QVBoxLayout(col)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        # top row: history | downloader pill | help
+        top = QHBoxLayout()
+        top.setSpacing(px(8))
+        top.addStretch(1)
+        hist_btn = PillButton("", "history", "round", h=30)
+        hist_btn.setToolTip("History")
+        hist_btn.clicked.connect(lambda: self.show_page(1))
+        top.addWidget(hist_btn)
+        self.src_pill = PillButton("Video Downloader", "", "white", chev=True, h=30, size=11.5, pad=14)
+        self.src_pill._icon = ""
+        self.src_pill.clicked.connect(self.open_parts_menu)
+        srow = Surface(h=30)
+        sl = QHBoxLayout(srow)
+        sl.setContentsMargins(px(8), 0, 0, 3)
+        sl.setSpacing(0)
+        sl.addWidget(SourceIcon())
+        self.src_pill.setStyleSheet("")
+        self.src_pill_wrap = srow
+        # draw as one pill: transparent button on a surface
+        self.src_pill._kind = "ghost"
+        self.src_pill._size = 11.5
+        self.src_pill._bold = True
+        self.src_pill._dark = True
+        self.src_pill.refit()
+        sl.addWidget(self.src_pill)
+        top.addWidget(srow)
+        help_btn = PillButton("", "question", "roundgray", h=30)
+        help_btn.setToolTip("FAQ")
+        help_btn.clicked.connect(self.show_faq)
+        top.addWidget(help_btn)
+        top.addStretch(1)
+        cl.addLayout(top)
+        cl.addSpacing(px(16))
+
+        self.heading = QLabel()
+        self.heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cl.addWidget(self.heading)
+        cl.addSpacing(px(20))
+
+        # link pill
+        lrow = QHBoxLayout()
+        lrow.addStretch(1)
+        link = Surface(h=38)
+        link.setFixedWidth(px(316))
+        ll = QHBoxLayout(link)
+        ll.setContentsMargins(px(15), 0, px(4), 3)
+        ll.setSpacing(px(6))
+        self.url = QLineEdit()
+        self.url.setPlaceholderText("Paste or copy a video link")
+        self.url_timer = QTimer(self)
+        self.url_timer.setSingleShot(True)
+        self.url_timer.setInterval(700)
+        self.url_timer.timeout.connect(self.on_url_typed)
+        self.url.textChanged.connect(self.on_url_changed)
+        self.url.returnPressed.connect(self.on_url_typed)
+        self.clear_btn = PillButton("Paste", "clipboard", "gray", h=30, size=10.5, pad=11)
+        self.clear_btn.clicked.connect(self.paste_or_clear)
+        ll.addWidget(self.url, 1)
+        ll.addWidget(self.clear_btn)
+        lrow.addWidget(link)
+        lrow.addStretch(1)
+        cl.addLayout(lrow)
+        cl.addSpacing(px(25))
+
+        # result card
+        self.card = Surface(radius=px(22))
+        sp = self.card.sizePolicy()
+        sp.setRetainSizeWhenHidden(True)
+        self.card.setSizePolicy(sp)
+        cv = QVBoxLayout(self.card)
+        cv.setContentsMargins(px(8), px(8), px(8), px(11))
+        cv.setSpacing(px(7))
+        trow = QHBoxLayout()
+        trow.setContentsMargins(px(7), px(7), px(7), 0)
+        trow.setSpacing(px(10))
+        self.pv_thumb = QLabel("▶")
+        self.pv_thumb.setFixedSize(px(124), px(70))
+        self.pv_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pv_thumb.setFont(mkfont(20))
+        self.pv_thumb.setStyleSheet(f"background: {T()['field']}; border-radius: {px(9)}px; color: {T()['sub']};")
+        info = QVBoxLayout()
+        info.setSpacing(px(2))
+        self.pv_title = ElidedLabel("", lines=2)
+        self.pv_title.setFont(mkfont(11.5, QFont.Weight.Bold))
+        self.pv_meta = ElidedLabel("")
+        self.pv_meta.setFont(mkfont(9.5, QFont.Weight.DemiBold))
+        self.pv_meta.setProperty("role", "muted")
+        self.rule = QFrame()
+        self.rule.setFixedHeight(1)
+        crow2 = QHBoxLayout()
+        crow2.setSpacing(px(4))
+        self.chips = {}
+        for key, icon in (("date", "calendar"), ("dur", "clock"), ("views", "eye"), ("likes", "thumb"), ("comments", "comment")):
+            c = Chip(icon, "")
+            c.hide()
+            self.chips[key] = c
+            crow2.addWidget(c)
+        crow2.addStretch(1)
+        info.addWidget(self.pv_title)
+        info.addWidget(self.pv_meta)
+        info.addStretch(1)
+        info.addWidget(self.rule)
+        info.addSpacing(px(3))
+        info.addLayout(crow2)
+        trow.addWidget(self.pv_thumb)
+        trow.addLayout(info, 1)
+        cv.addLayout(trow)
+        self.strip = StripWidget()
+        self.strip.setFixedHeight(px(42))
+        sh = QHBoxLayout(self.strip)
+        sh.setContentsMargins(px(7), px(7), px(7), px(7))
+        sh.setSpacing(px(6))
+        self.q_btn = PillButton("Quality", "", "white", chev=True, h=27, size=11.5, bold=True, pad=16)
+        self.q_btn.setMinimumWidth(px(96))
+        self.q_btn.clicked.connect(self.open_quality_menu)
+        self.playlist = QCheckBox("Playlist")
+        self.playlist.hide()
+        self.go = PillButton("Download", "download", "red", h=27, size=11.5, bold=True)
+        self.go.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.go.clicked.connect(self.on_download)
+        sh.addWidget(self.q_btn)
+        sh.addWidget(self.playlist)
+        sh.addWidget(self.go, 1)
+        cv.addWidget(self.strip)
+        self.card.hide()
+        cl.addWidget(self.card)
+
+        # queue
+        self.qhead = QWidget()
+        qh = QHBoxLayout(self.qhead)
+        qh.setContentsMargins(px(6), px(10), px(6), 0)
+        ql = mk_label("Downloads", 12, QFont.Weight.Bold)
+        clr = PillButton("Clear finished", "", "ghost", h=22, size=10.5, pad=6)
+        clr.clicked.connect(self.clear_finished)
+        qh.addWidget(ql)
+        qh.addStretch(1)
+        qh.addWidget(clr)
+        self.qhead.hide()
+        cl.addWidget(self.qhead)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setMaximumHeight(px(118))
+        inner = QWidget()
+        self.jobs_lay = QVBoxLayout(inner)
+        self.jobs_lay.setContentsMargins(0, px(4), 0, 0)
+        self.jobs_lay.setSpacing(px(6))
+        self.jobs_lay.addStretch(1)
+        self.scroll.setWidget(inner)
+        self.scroll.hide()
+        cl.addWidget(self.scroll)
+
+        cl.addSpacing(px(24))
+        self.terms = QLabel()
+        self.terms.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.terms.setWordWrap(True)
+        self.terms.setFont(mkfont(9.5))
+        self.terms.linkActivated.connect(self.on_terms_link)
+        cl.addWidget(self.terms)
+
+        crow.addWidget(col)
+        crow.addStretch(1)
+        lay.addLayout(crow)
+        lay.addStretch(1)
+        self.refresh_parts_ui()
+        self.refresh_link_style()
+        w = QScrollArea()
+        w.setWidgetResizable(True)
+        w.setFrameShape(QFrame.Shape.NoFrame)
+        w.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        w.setWidget(body)
+        return w
+
+    def refresh_link_style(self):
+        t = T()
+        acc = QColor(STYLE["accent"]).darker(112 if STYLE["theme"] == "light" else 60).name() \
+            if STYLE["theme"] == "light" else QColor(STYLE["accent"]).lighter(125).name()
+        self.heading.setFont(mkfont(36, QFont.Weight.Light))
+        self.heading.setText(f'<span style="font-weight:300">Insert </span><span style="font-weight:700">Your Link</span>'
+                             f'<span style="font-weight:300"> Down Below</span>')
+        self.terms.setText(
+            f'<span style="color:{t["sub"]}">By using RedGet you accept the </span>'
+            f'<a style="color:{acc}" href="terms">Terms of Service</a>'
+            f'<span style="color:{t["sub"]}"> and </span><a style="color:{acc}" href="privacy">Privacy Note</a>')
+        f = self.url.font()
+        self.url.setFont(mkfont(10.5, QFont.Weight.DemiBold))
+        self.update_url_look()
+        self.rule.setStyleSheet(f"background: {t['line']}; border: none;")
+        self.pv_thumb.setStyleSheet(f"background: {t['field']}; border-radius: {px(9)}px; color: {t['sub']};")
+        self.pv_title.setFont(mkfont(11.5, QFont.Weight.Bold))
+
+    def update_url_look(self):
+        txt = self.url.text().strip()
+        valid = bool(URL_RE.match(txt))
+        f = self.url.font()
+        f.setUnderline(valid)
+        self.url.setFont(f)
+        acc = QColor(STYLE["accent"]).darker(112).name() if STYLE["theme"] == "light" else QColor(STYLE["accent"]).lighter(130).name()
+        self.url.setStyleSheet(f"QLineEdit {{ color: {acc if valid else T()['text']}; }}")
+        if txt:
+            self.clear_btn.set_label("Clear", "close")
+        else:
+            self.clear_btn.set_label("Paste", "clipboard")
+
+    def on_terms_link(self, href):
+        if href == "terms":
+            QMessageBox.information(self, "Terms of Service",
+                                    "Download only content you own or have permission to save, and respect the terms "
+                                    "of each site you download from. RedGet is a front-end for yt-dlp and is "
+                                    "provided as is.")
+        else:
+            QMessageBox.information(self, "Privacy Note",
+                                    "RedGet runs entirely on this computer. Links you paste are sent only to the site "
+                                    "you download from. Your history stays in a file in your home folder, and you can "
+                                    "clear it from the History page.")
+
+    def open_parts_menu(self):
+        m = QMenu(self)
+        h = m.addAction("Download in parts")
+        h.setEnabled(False)
+        for i, (name, _v) in enumerate(PARTS_CHOICES):
+            a = m.addAction(name)
+            a.setCheckable(True)
+            a.setChecked(i == self.parts_idx())
+            a.triggered.connect(lambda _=False, i=i: self.set_parts(i))
+        m.addSeparator()
+        d = m.addAction("Preview copied links")
+        d.setCheckable(True)
+        d.setChecked(self.sbool("detect", True))
+        d.triggered.connect(lambda on: self.settings.setValue("detect", "true" if on else "false"))
+        m.exec(self.src_pill_wrap.mapToGlobal(QPoint(0, self.src_pill_wrap.height() + px(4))))
+
+    def refresh_parts_ui(self):
+        if hasattr(self, "parts_btns"):
+            for i, b in enumerate(self.parts_btns):
+                b.setChecked(i == self.parts_idx())
+
+    def update_dir_ui(self):
+        base = os.path.basename(self.dir.rstrip("/")) or self.dir
+        fm = QFontMetrics(mkfont(11.5, QFont.Weight.DemiBold))
+        self.folder_btn.set_label(fm.elidedText(base, Qt.TextElideMode.ElideRight, px(130)))
+        self.folder_btn.setToolTip(self.dir)
+        if hasattr(self, "app_pill"):
+            self.app_pill.update()
+        if hasattr(self, "dir_edit"):
+            self.dir_edit.setText(self.dir)
+
+    # ---------- quality / card
+    def set_quality_items(self, items):
+        self.q_items = items
+        self.q_idx = default_quality(items) if items else 0
+        self.refresh_quality_ui()
+
+    def refresh_quality_ui(self):
+        if not self.q_items:
+            self.q_btn.set_label("Quality")
+            self.go.set_label("Download")
+            return
+        label, _pl, size = self.q_items[self.q_idx]
+        self.q_btn.set_label(label.replace(" (4K)", ""))
+        self.go.set_label("Download" + (f"  •  {fmt_size(size)}" if size else ""))
+
+    def open_quality_menu(self):
+        if not self.q_items:
+            return
+        m = QMenu(self)
+        for i, (label, _pl, size) in enumerate(self.q_items):
+            a = m.addAction(label + (f"      {fmt_size(size)}" if size else ""))
+            a.setCheckable(True)
+            a.setChecked(i == self.q_idx)
+            a.triggered.connect(lambda _=False, i=i: self.pick_quality(i))
+        m.exec(self.q_btn.mapToGlobal(QPoint(0, self.q_btn.height() + px(4))))
+
+    def pick_quality(self, i):
+        self.q_idx = i
+        self.refresh_quality_ui()
+
+    def set_chips(self, info=None):
+        vals = {}
+        if info:
+            vals = dict(date=info["date"], dur=info["duration"],
+                        views=(fmt_count(info["views"]) + " Views") if info["views"] else "",
+                        likes=(fmt_count(info["likes"]) + " Likes") if info["likes"] else "",
+                        comments=fmt_count(info["comments"]) if info["comments"] else "")
+        for k, c in self.chips.items():
+            v = vals.get(k, "")
+            c.set_text(v)
+            c.setVisible(bool(v))
+
+    # ---------- engine bar
+    def build_bottom(self):
+        row = QHBoxLayout()
+        row.setSpacing(px(7))
+        row.setContentsMargins(0, px(12), 0, 0)
+        self.app_pill = AppPill(self)
+        row.addWidget(self.app_pill, 0, Qt.AlignmentFlag.AlignBottom)
+        soc = Surface(h=32)
+        sl = QHBoxLayout(soc)
+        sl.setContentsMargins(px(5), 0, px(5), 3)
+        sl.setSpacing(px(4))
+        for icon, tip, fn in (("globe", "Supported sites", lambda: QDesktopServices.openUrl(QUrl(SUPPORTED_URL))),
+                              ("code", "yt-dlp on GitHub", lambda: QDesktopServices.openUrl(QUrl(SOURCE_URL))),
+                              ("info", "About RedGet", self.show_about)):
+            b = PillButton("", icon, "roundgray", h=24)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            sl.addWidget(b)
+        row.addWidget(soc, 0, Qt.AlignmentFlag.AlignBottom)
+        notice = Surface(h=32)
+        nl = QHBoxLayout(notice)
+        nl.setContentsMargins(px(16), 0, px(5), 3)
+        nl.setSpacing(px(6))
+        self.notice_text = ElidedLabel("")
+        self.notice_text.setFont(mkfont(10, QFont.Weight.DemiBold))
+        self.notice_no = PillButton("Settings", "close", "gray", h=24, size=10, pad=11)
+        self.notice_yes = PillButton("Update", "check", "red", h=24, size=10, bold=True, pad=13)
+        self.notice_no.clicked.connect(self.on_notice_no)
+        self.notice_yes.clicked.connect(self.on_notice_yes)
+        nl.addWidget(self.notice_text, 1)
+        nl.addWidget(self.notice_no)
+        nl.addWidget(self.notice_yes)
+        row.addWidget(notice, 1, Qt.AlignmentFlag.AlignBottom)
+        return row
+
+    def set_notice(self, mode, text, no=None, yes=None):
+        self.notice_mode = mode
+        self.notice_text.set_full(text)
+        for b, spec in ((self.notice_no, no), (self.notice_yes, yes)):
+            if spec:
+                b.set_label(spec[0], spec[1])
+                b.show()
+            else:
+                b.hide()
+
+    def refresh_engine_state(self):
+        if self.engine.busy:
+            return
+        if not engine_exists() or (has_local_engine() and not which_in_path("deno")):
+            self.set_notice("missing", "RedGet needs to set up its download engine (one-time, about 45 MB).",
+                            ("Not now", "close"), ("Set up", "check"))
+            if not engine_exists():
+                return
+        p = QProcess(self)
+        p.setProcessEnvironment(proc_env())
+        p.finished.connect(lambda code, _s, pp=p: self.on_version(code, pp))
+        start_engine(p, ["--version"])
+
+    def on_version(self, code, p):
+        out = bytes(p.readAllStandardOutput()).decode("utf-8", "replace").strip()
+        p.deleteLater()
+        if code == 0 and out and not self.engine.busy:
+            self.engine_version = out.splitlines()[-1]
+            if self.notice_mode != "missing":
+                self.set_notice("ready", f"Download engine ready  ·  {self.engine_version}", ("Settings", "close"), ("Update", "check"))
+
+    def on_notice_no(self):
+        if self.notice_mode == "update":
+            self.refresh_engine_state()
+        elif self.notice_mode == "missing":
+            self.set_notice("tip", "Tip: copy any link and RedGet shows the video here automatically.", ("Settings", "close"), None)
+        else:
+            self.show_page(2)
+
+    def on_notice_yes(self):
+        if self.notice_mode == "update":
+            self.restart_app()
+        else:
+            self.engine.run()
+
+    def on_engine_status(self, text):
+        if self.engine.busy:
+            self.set_notice("busy", text)
+
+    def on_engine_done(self, ok, msg):
+        if ok:
+            self.refresh_engine_state()
+            if self.last_clip:
+                self.show_preview(self.last_clip)
+        else:
+            self.set_notice("missing", msg, ("Close", "close"), ("Try again", "check"))
+
+    # ---------- history page
+    def build_history_page(self):
+        w = QWidget()
+        outer = QHBoxLayout(w)
+        outer.setContentsMargins(0, px(16), 0, px(6))
+        outer.addStretch(1)
+        col = QWidget()
+        col.setFixedWidth(px(640))
+        lay = QVBoxLayout(col)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(px(10))
+        row = QHBoxLayout()
+        t = mk_label("History", 20, QFont.Weight.Bold, role=None)
+        hint = mk_label("Double-click a download to open its folder", 11, role="muted")
+        clr = PillButton("Clear history", "close", "gray", h=26, size=10.5)
+        clr.clicked.connect(self.clear_history)
+        v = QVBoxLayout()
+        v.setSpacing(0)
+        v.addWidget(t)
+        v.addWidget(hint)
+        row.addLayout(v, 1)
+        row.addWidget(clr, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addLayout(row)
+        self.hist = QListWidget()
+        self.hist.setObjectName("hist")
+        self.hist.setFont(mkfont(12, QFont.Weight.DemiBold))
+        self.hist.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self.hist.itemDoubleClicked.connect(lambda it: self.open_folder(it.data(Qt.ItemDataRole.UserRole)))
+        lay.addWidget(self.hist, 1)
+        outer.addWidget(col)
+        outer.addStretch(1)
+        return w
+
+    def refresh_history(self):
+        self.hist.clear()
+        for h in self.history:
+            kind = "Audio" if h.get("kind") == "audio" else "Video"
+            it = QListWidgetItem(f"{h.get('title', '')}\n{kind}  ·  {h.get('time', '')}\n{h.get('folder', '')}")
+            it.setData(Qt.ItemDataRole.UserRole, h.get("folder", DEFAULT_DIR))
+            self.hist.addItem(it)
+
+    def clear_history(self):
+        self.history = []
+        save_history(self.history)
+        self.refresh_history()
+
+    # ---------- settings page
+    def section(self, title):
+        f = Surface(radius=px(18))
+        lay = QVBoxLayout(f)
+        lay.setContentsMargins(px(18), px(14), px(18), px(18))
+        lay.setSpacing(px(10))
+        lay.addWidget(mk_label(title, 13, QFont.Weight.Bold))
+        return f, lay
+
+    def build_settings_page(self):
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(0, px(10), 0, 0)
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.Shape.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget()
+        hl = QHBoxLayout(body)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.addStretch(1)
+        col = QWidget()
+        col.setFixedWidth(px(560))
+        lay = QVBoxLayout(col)
+        lay.setContentsMargins(0, 0, px(6), px(8))
+        lay.setSpacing(px(12))
+        hl.addWidget(col)
+        hl.addStretch(1)
+        sc.setWidget(body)
+        outer.addWidget(sc)
+
+        c, cl = self.section("Appearance")
+        row = QHBoxLayout()
+        row.setSpacing(px(8))
+        self.theme_buttons = {}
+        for name, key in (("Light", "light"), ("Dark", "dark")):
+            b = PillButton(name, "sun" if key == "light" else "moon", "gray", h=28, size=11)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _=False, k=key: self.set_theme(k))
+            self.theme_buttons[key] = b
+            row.addWidget(b)
+        row.addStretch(1)
+        cl.addLayout(row)
+        cl.addWidget(mk_label("Accent color", 11, role="muted"))
+        grid = QGridLayout()
+        grid.setSpacing(px(8))
+        self.swatches = []
+        for i, (name, _c) in enumerate(ACCENTS):
+            b = QPushButton()
+            b.setFixedSize(px(30), px(30))
+            b.setToolTip(name)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, i=i: self.set_accent(ACCENTS[i][1]))
+            self.swatches.append(b)
+            grid.addWidget(b, i // 8, i % 8)
+        cl.addLayout(grid)
+        custom = PillButton("Pick any color…", "", "gray", h=28, size=11)
+        custom.clicked.connect(self.pick_custom)
+        cl.addWidget(custom, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(c)
+
+        c, cl = self.section("Downloads")
+        cl.addWidget(mk_label("Download in parts", 11, role="muted"))
+        row = QHBoxLayout()
+        row.setSpacing(px(8))
+        self.parts_btns = []
+        for i, (name, _v) in enumerate(PARTS_CHOICES):
+            b = PillButton(name, "", "gray", h=28, size=11)
+            b.setCheckable(True)
+            b.setChecked(i == self.parts_idx())
+            b.clicked.connect(lambda _=False, i=i: self.set_parts(i))
+            self.parts_btns.append(b)
+            row.addWidget(b)
+        row.addStretch(1)
+        cl.addLayout(row)
+        cl.addWidget(mk_label("Save to", 11, role="muted"))
+        row = QHBoxLayout()
+        row.setSpacing(px(8))
+        self.dir_edit = QLineEdit(self.dir)
+        self.dir_edit.setObjectName("field")
+        self.dir_edit.setReadOnly(True)
+        br = PillButton("Browse…", "folder", "gray", h=28, size=11)
+        br.clicked.connect(self.browse)
+        row.addWidget(self.dir_edit, 1)
+        row.addWidget(br)
+        cl.addLayout(row)
+        self.detect_cb = QCheckBox("Show a preview when I copy a link")
+        self.detect_cb.setChecked(self.sbool("detect", True))
+        self.detect_cb.toggled.connect(lambda on: self.settings.setValue("detect", "true" if on else "false"))
+        cl.addWidget(self.detect_cb)
+        lay.addWidget(c)
+
+        c, cl = self.section("RedGet updates")
+        self.upd_label = mk_label(f"RedGet {VERSION}  ·  updates come from github.com/{UPDATE_REPO}", 11.5, role="muted", wrap=True)
+        cl.addWidget(self.upd_label)
+        self.auto_cb = QCheckBox("Install updates automatically")
+        self.auto_cb.setChecked(self.sbool("auto_update", True))
+        self.auto_cb.toggled.connect(lambda on: self.settings.setValue("auto_update", "true" if on else "false"))
+        cl.addWidget(self.auto_cb)
+        ub = PillButton("Check for updates", "download", "red", h=28, size=11, bold=True)
+        ub.clicked.connect(self.check_update_now)
+        cl.addWidget(ub, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(c)
+
+        c, cl = self.section("Download engine")
+        self.eng_label = mk_label("Checking…", 11.5, role="muted", wrap=True)
+        cl.addWidget(self.eng_label)
+        eb = PillButton("Update engine", "download", "red", h=28, size=11, bold=True)
+        eb.clicked.connect(self.engine.run)
+        cl.addWidget(eb, 0, Qt.AlignmentFlag.AlignLeft)
+        self.engine.status.connect(self.eng_label.setText)
+        lay.addWidget(c)
+        lay.addStretch(1)
+        self.update_dir_ui()
+        return w
+
+    def refresh_swatches(self):
+        if not hasattr(self, "swatches"):
+            return
+        ring = T()["text"]
+        cur = STYLE["accent"].lower()
+        for i, b in enumerate(self.swatches):
+            col = ACCENTS[i][1]
+            border = f"3px solid {ring}" if col.lower() == cur else "3px solid transparent"
+            b.setStyleSheet(f"QPushButton {{ background: {col}; border: {border}; border-radius: {px(15)}px; padding: 0; }}"
+                            f"QPushButton:hover {{ border: 3px solid {ring}; background: {col}; }}")
+
+    def pick_custom(self):
+        c = QColorDialog.getColor(QColor(STYLE["accent"]), self, "Pick an accent color")
+        if c.isValid():
+            self.set_accent(c.name())
+
+    # ---------- link entry
+    def paste_or_clear(self):
+        if self.url.text().strip():
+            self.url.clear()
+            self.card.hide()
+            self.last_clip = ""
+            self.src_pill.set_label("Video Downloader")
+            return
+        txt = QGuiApplication.clipboard().text().strip()
+        m = URL_RE.search(txt)
+        if m:
+            link = m.group(0).rstrip(").,;")
+            self.url.setText(link)
+            self.last_clip = link
+            self.show_preview(link)
+        elif txt:
+            self.url.setText(txt)
+
+    def on_url_changed(self, *_):
+        self.update_url_look()
+        self.url_timer.start()
+        QTimer.singleShot(0, lambda: self.url.setCursorPosition(0) if not self.url.hasFocus() else None)
+
+    def on_url_typed(self):
+        m = URL_RE.match(self.url.text().strip())
+        if not m:
+            return
+        link = m.group(0)
+        if link != self.last_clip or not self.card.isVisible():
+            self.last_clip = link
+            self.show_preview(link)
+
+    def browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Choose download folder", self.dir)
+        if d:
+            self.set_dir(d)
+
+    def open_folder(self, path):
+        try:
+            os.makedirs(path, exist_ok=True)
+        except Exception:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def on_app_state(self, state):
+        if state == Qt.ApplicationState.ApplicationActive:
+            self.check_clipboard()
+
+    def check_clipboard(self):
+        if not self.sbool("detect", True):
+            return
+        try:
+            text = self.clip.text()
+        except Exception:
+            return
+        m = URL_RE.search(text or "")
+        if not m:
+            return
+        link = m.group(0).rstrip(").,;")
+        if link == self.clip_seen:
+            return
+        self.clip_seen = link
+        if link == self.last_clip:
+            return
+        self.last_clip = link
+        self.url.setText(link)
+        self.show_preview(link)
+
+    # ---------- video preview
+    def show_preview(self, link):
+        self.card.show()
+        self.thumb_pix = None
+        self.strip.set_thumb(None)
+        self.pv_thumb.clear()
+        self.pv_thumb.setText("▶")
+        self.pv_title.set_full(link)
+        self.pv_meta.set_full("Reading the link…")
+        self.set_chips(None)
+        self.playlist.hide()
+        self.playlist.setChecked(False)
+        generic = [(f"{h}p" + (" (4K)" if h == 2160 else ""), ("video", h), 0) for h in GENERIC_HEIGHTS] + \
+                  [(l, ("audio", e), 0) for l, e in AUDIO_CHOICES]
+        self.set_quality_items(generic)
+        self.src_pill.set_label("Video Downloader")
+        self.probe(link)
+
+    def probe(self, link):
+        old = self.probe_proc
+        if not engine_exists():
+            self.pv_meta.set_full("The download engine is missing. Set it up from the bar below.")
+            return
+        p = QProcess(self)
+        self.probe_proc = p
+        p.setProcessEnvironment(proc_env())
+        p.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        timer = QTimer(p)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda pp=p: kill_group(pp, signal.SIGKILL))
+        p.finished.connect(lambda code, _st, pp=p, l=link: self.probe_done(pp, l, code))
+        start_engine(p, ["-J", "--no-playlist", "--playlist-items", "1", "--no-warnings", "--skip-download", "--", link])
+        timer.start(45000)
+        if old is not None and old.state() != QProcess.ProcessState.NotRunning:
+            kill_group(old, signal.SIGKILL)
+
+    def probe_done(self, p, link, code):
+        try:
+            if p is not self.probe_proc or link != self.last_clip:
+                p.deleteLater()
+                return
+            raw = bytes(p.readAllStandardOutput()).decode("utf-8", "replace")
+            info = None
+            if code == 0 and raw.strip():
+                try:
+                    info = parse_probe(raw, link)
+                except Exception as e:
+                    log_error("probe parse: " + repr(e))
+            if info is None:
+                err = bytes(p.readAllStandardError()).decode("utf-8", "replace")
+                if "403" in err or "JavaScript" in err or not has_local_engine():
+                    self.refresh_engine_state()
+                self.pv_meta.set_full("Couldn't read this link. You can still choose a quality and try.")
+                return
+            self.pv_title.set_full(info["title"] or link)
+            if info["playlist"]:
+                meta = "Playlist" + (f", {info['count']} videos" if info["count"] else "")
+                if info["uploader"]:
+                    meta = f"By {info['uploader']}  ·  " + meta
+                self.playlist.show()
+                self.playlist.setChecked(bool(info["pure_playlist"]))
+            else:
+                meta = ("By " + info["uploader"]) if info["uploader"] else ""
+            self.pv_meta.set_full(meta)
+            self.set_chips(info)
+            if info["site"]:
+                self.src_pill.set_label(f"{info['site']} Downloader")
+            self.set_quality_items(quality_items(info["formats"]))
+            if info["thumb"].startswith("http"):
+                self.fetch_thumb(link, info["thumb"])
+        except RuntimeError:
+            pass
+        finally:
+            try:
+                p.deleteLater()
+            except RuntimeError:
+                pass
+
+    def fetch_thumb(self, link, turl):
+        turl = turl.replace("/vi_webp/", "/vi/").replace(".webp", ".jpg")
+        req = QNetworkRequest(QUrl(turl))
+        req.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                         QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
+        req.setTransferTimeout(20000)
+        reply = self.nam.get(req)
+        reply.finished.connect(lambda r=reply, l=link: self.thumb_done(r, l))
+
+    def thumb_done(self, reply, link):
+        try:
+            if reply.error() == QNetworkReply.NetworkError.NoError and link == self.last_clip:
+                pix = QPixmap()
+                if pix.loadFromData(bytes(reply.readAll())):
+                    self.thumb_pix = pix
+                    self.pv_thumb.setText("")
+                    self.pv_thumb.setPixmap(rounded_pix(pix, px(124), px(70), px(9), self.devicePixelRatioF()))
+                    self.strip.set_thumb(pix)
+        finally:
+            reply.deleteLater()
+
+    # ---------- downloading
+    def on_download(self):
+        urls = [u for u in self.url.text().split() if URL_RE.match(u)]
+        if not urls:
+            self.pv_meta.set_full("Paste a link that starts with http:// or https://")
+            return
+        if not self.q_items:
+            self.open_quality_menu()
+            return
+        self.add_jobs(urls, self.q_items[self.q_idx][1])
+
+    def build_args(self, payload, outdir, playlist):
+        if playlist:
+            tmpl = "%(playlist_title,title).100s/%(playlist_index|0)s - %(title).150s.%(ext)s"
+        else:
+            tmpl = "%(title).150s.%(ext)s"
+        base = ["--newline", "--no-colors", "--progress", "--no-simulate",
+                "--yes-playlist" if playlist else "--no-playlist",
+                "--retries", "10", "--fragment-retries", "10", "--socket-timeout", "30", "--embed-metadata",
+                "--progress-template",
+                "download:RG_DL" + SEP + SEP.join("%(progress." + k + ")s" for k in
+                                                  ("downloaded_bytes", "total_bytes", "total_bytes_estimate", "speed", "eta", "filename")),
+                "--progress-template", "postprocess:RG_PP" + SEP + "%(progress.postprocessor)s" + SEP + "%(progress.status)s",
+                "--print", "before_dl:RG_ITEM" + SEP + SEP.join(["%(playlist_index)s", "%(playlist_count)s", "%(title)s",
+                                                                  "%(requested_formats.1.format_id|)s"]),
+                "--print", "after_move:RG_DONE" + SEP + "%(filepath)s",
+                "-o", os.path.join(outdir, tmpl)]
+        kind, val = payload
+        if kind == "audio":
+            fmt = ["-x", "--audio-format", val, "--audio-quality", "0", "-f", "ba/b"]
+        else:
+            fmt = ["-f", f"bv*[height<={val}]+ba/b[height<={val}]", "-S", "res,ext:mp4:m4a", "--merge-output-format", "mp4"]
+        parts = PARTS_CHOICES[self.parts_idx()][1]
+        if parts == 0:
+            return base + ["-N", "1"] + fmt, None
+        safe = base + ["-N", str(parts), "--http-chunk-size", "10M"] + fmt
+        if shutil.which("aria2c"):
+            p = min(parts, 8)
+            fast = base + ["-N", str(parts), "--downloader", "dash,m3u8:native", "--downloader", "aria2c",
+                           "--downloader-args", f"aria2c:-x {p} -s {p} -k 1M -j {p} --file-allocation=none"] + fmt
+            return fast, safe
+        return safe, None
+
+    def add_jobs(self, urls, payload):
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+        except Exception as e:
+            self.pv_meta.set_full(f"Can't use this folder: {e}")
+            return
+        playlist = self.playlist.isVisible() and self.playlist.isChecked()
+        single_title = self.pv_title._full if len(urls) == 1 and self.thumb_pix is not None or (len(urls) == 1 and self.chips["dur"].isVisible()) else ""
+        for u in urls:
+            args, fallback = self.build_args(payload, self.dir, playlist)
+            widget = JobWidget(u)
+            job = Job(u, args, fallback, self.dir, "audio" if payload[0] == "audio" else "video", widget, playlist)
+            if single_title:
+                widget.set_title(single_title)
+                job.title = single_title
+            job.done.connect(self.on_done)
+            widget.btn.clicked.connect(lambda _=False, j=job: self.cancel_job(j))
+            self.jobs_lay.insertWidget(0, widget)
+            self.jobs.append(job)
+        self.url.clear()
+        self.last_clip = ""
+        self.card.hide()
+        self.src_pill.set_label("Video Downloader")
+        self.refresh_layout_state()
+        self.next_job()
+
+    def refresh_layout_state(self):
+        has = len(self.jobs) > 0
+        self.qhead.setVisible(has)
+        self.scroll.setVisible(has)
+        sp = self.card.sizePolicy()
+        sp.setRetainSizeWhenHidden(not has)
+        self.card.setSizePolicy(sp)
+        self.card.setMinimumHeight(px(139))
+        self.card.updateGeometry()
+        self.heading.setVisible(not has)
+        self.terms.setVisible(not has)
+
+    def next_job(self):
+        if self.current is not None:
+            return
+        for job in self.jobs:
+            if job.state == "queued" and not job.cancelled:
+                self.current = job
+                job.start()
+                return
+
+    def cancel_job(self, job):
+        if job.state == "running":
+            job.cancel()
+        elif job.state == "queued":
+            job.cancelled = True
+            job.state = "cancel"
+            job.w.set_status("Cancelled")
+            job.w.btn.set_label("", "close")
+        else:
+            self.remove_job(job)
+
+    def remove_job(self, job):
+        if job in self.jobs:
+            self.jobs.remove(job)
+        job.w.setParent(None)
+        job.w.deleteLater()
+        self.refresh_layout_state()
+
+    def on_done(self, job, state):
+        w = job.w
+        if state == "ok":
+            w.bar.setValue(1000)
+            w.set_status("Done")
+            folder = os.path.dirname(job.dest) if job.dest and not job.playlist else job.outdir
+            self.history.insert(0, {"title": job.title, "url": job.url, "folder": folder or job.outdir,
+                                    "kind": job.kind, "time": time.strftime("%Y-%m-%d %H:%M")})
+            save_history(self.history)
+            self.refresh_history()
+        elif state == "cancel":
+            w.set_status("Cancelled")
+        else:
+            msg = job.err or "The download failed"
+            if "403" in msg:
+                msg = "The site refused the download (403). Update the engine from the bar below."
+                self.refresh_engine_state()
+            w.set_status(msg)
+            log_error(f"download failed: {job.url}: {job.err}")
+        w.btn.setToolTip("Remove")
+        if self.current is job:
+            self.current = None
+        QTimer.singleShot(0, self.next_job)
+
+    def clear_finished(self):
+        for job in list(self.jobs):
+            if job.state in ("ok", "fail", "cancel"):
+                self.remove_job(job)
+
+    def closeEvent(self, e):
+        for pr in [self.probe_proc] + [j.proc for j in self.jobs]:
+            try:
+                if pr and pr.state() != QProcess.ProcessState.NotRunning:
+                    kill_group(pr, signal.SIGTERM)
+            except RuntimeError:
+                pass
+        for j in self.jobs:
+            j.cancelled = True
+        for pr in [j.proc for j in self.jobs]:
+            try:
+                if pr and pr.state() != QProcess.ProcessState.NotRunning:
+                    if not pr.waitForFinished(1500):
+                        kill_group(pr, signal.SIGKILL)
+                        pr.waitForFinished(500)
+            except RuntimeError:
+                pass
+        e.accept()
+
+
+class AppPill(QWidget):
+    """Red pill (opens the downloads folder); a small app preview sticks out of its top edge."""
+    def __init__(self, main):
+        super().__init__()
+        self.main = main
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setFixedSize(px(172), px(32) + 3)
+        self._hover = False
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.main.open_folder(self.main.dir)
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(0.5, 0.5, self.width() - 1, self.height() - 3.5)
+        rad = r.height() / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 40))
+        p.drawRoundedRect(r.adjusted(0, 1.2, 0, 1.8), rad, rad)
+        p.setBrush(red_gradient(r))
+        p.setPen(QPen(accent_trio()[2].darker(115), 1))
+        p.drawRoundedRect(r, rad, rad)
+        hl = QLinearGradient(r.topLeft(), QPointF(r.left(), r.top() + r.height() * 0.55))
+        hl.setColorAt(0, QColor(255, 255, 255, 90 if self._hover else 65))
+        hl.setColorAt(1, QColor(255, 255, 255, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(hl)
+        p.drawRoundedRect(r.adjusted(1, 1, -1, -1), rad - 1, rad - 1)
+        tx = px(14) + px(40) + px(10)
+        tw = r.right() - tx - px(8)
+        p.setPen(QColor("#ffffff"))
+        p.setFont(mkfont(11, QFont.Weight.Bold))
+        p.drawText(QRectF(tx, r.top() + px(3), tw, px(15)), Qt.AlignmentFlag.AlignVCenter, "Open Downloads")
+        f2 = mkfont(8.5, QFont.Weight.Medium)
+        p.setFont(f2)
+        p.setPen(QColor(255, 255, 255, 215))
+        base = os.path.basename(self.main.dir.rstrip("/")) or self.main.dir
+        p.drawText(QRectF(tx, r.top() + px(17), tw, px(12)), Qt.AlignmentFlag.AlignVCenter,
+                   QFontMetrics(f2).elidedText("Folder: " + base, Qt.TextElideMode.ElideRight, int(tw)))
+
+
+class PhoneOverlay(QWidget):
+    """The little app preview that overlaps the red pill (drawn above the layout)."""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFixedSize(px(44), px(58))
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pw, pht = px(40), px(52)
+        pr = QRectF(px(2), px(2), pw, pht)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 55))
+        p.drawRoundedRect(pr.adjusted(-1, 1, 1, 3), px(8), px(8))
+        p.setBrush(QColor("#fbfbfb"))
+        p.setPen(QPen(QColor(255, 255, 255, 230), 1.2))
+        p.drawRoundedRect(pr, px(8), px(8))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#2a2c31"))
+        p.drawRoundedRect(QRectF(pr.left() + pw * 0.2, pr.top() + pht * 0.17, pw * 0.6, px(3)), px(1.5), px(1.5))
+        p.drawRoundedRect(QRectF(pr.left() + pw * 0.3, pr.top() + pht * 0.17 + px(6), pw * 0.4, px(3)), px(1.5), px(1.5))
+        p.setBrush(QColor("#e4e4e4"))
+        p.drawRoundedRect(QRectF(pr.left() + pw * 0.16, pr.top() + pht * 0.47, pw * 0.68, px(6)), px(3), px(3))
+        p.setBrush(QColor("#d8d8d8"))
+        p.drawRoundedRect(QRectF(pr.left() + pw * 0.16, pr.top() + pht * 0.64, pw * 0.68, px(12)), px(3), px(3))
+        p.setBrush(accent_trio()[1])
+        p.drawRoundedRect(QRectF(pr.left() + pw * 0.2, pr.top() + pht * 0.78, pw * 0.6, px(5)), px(2.5), px(2.5))
+
+
+def main():
+    global K
+    sys.excepthook = excepthook
+    maybe_run_newer()
+    app = QApplication(sys.argv)
+    app.setApplicationName("RedGet")
+    app.setApplicationVersion(VERSION)
+    app.setDesktopFileName("redget")
+    app.setStyle("Fusion")
+    STYLE["family"] = pick_family()
+    app.setFont(QFont(STYLE["family"]))
+    scr = app.primaryScreen().availableGeometry()
+    try:
+        K = float(os.environ.get("REDGET_SCALE", "0"))
+    except ValueError:
+        K = 0.0
+    if K <= 0:
+        K = max(0.95, min(1.3, min(scr.height() * 0.85 / 576.0, scr.width() * 0.85 / 920.0)))
+    make_check_png()
+    win = Main()
+    w, h = min(px(920), scr.width()), min(px(576), scr.height())
+    try:
+        env = os.environ.get("REDGET_SIZE", "")
+        if env:
+            w, h = [int(v) for v in env.lower().split("x")]
+    except ValueError:
+        pass
+    win.setMinimumSize(min(px(780), scr.width()), min(px(520), scr.height()))
+    win.resize(w, h)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        log_error(traceback.format_exc())
+        raise

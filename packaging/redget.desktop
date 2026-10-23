@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=RedGet
+GenericName=Video Downloader
+Comment=Download videos or audio from any link
+Exec=redget
+Icon=redget
+Terminal=false
+Type=Application
+Categories=AudioVideo;Network;
+Keywords=youtube;video;audio;download;yt-dlp;
+StartupWMClass=redget
