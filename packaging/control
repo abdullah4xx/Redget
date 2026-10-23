@@ -8,5 +8,5 @@ Recommends: qt6-wayland, qt6-image-formats-plugins, fonts-inter
 Maintainer: Abdullah <abdullah@localhost>
 Description: RedGet - video/audio downloader (PyQt6)
  Paste or copy a link, see the video, pick a quality, download.
- Glass-style red theme with light and dark modes,
+ Glass-style interface with light, dark and woven ink-and-brass themes,
  custom accent colors, parallel parts, verified engine updates and history.

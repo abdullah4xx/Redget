@@ -7,6 +7,9 @@ Video/audio downloader (PyQt6 front-end for yt-dlp). Paste a link, see the video
 sudo apt install ./redget_<version>_all.deb
 ```
 
+Settings offer Light, Dark, and Woven themes. Woven uses a deep ink-and-brass palette inspired by the
+standalone Redgetweb5 design while keeping the existing accent-color controls.
+
 ## Automatic updates
 RedGet checks `version.json` in this repository (on start, then every 6 hours). When a newer version
 is published it downloads `redget`, verifies the SHA-256 and the syntax, stores it in
